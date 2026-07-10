@@ -22,9 +22,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal, Optional, Sequence
 
+import math
+
 
 KnotRegion = Literal["edge_upper", "edge_lower", "center"]
-SurfaceClass = Literal["side_wide", "side_narrow", "end"]
+SurfaceClass = Literal["side_wide", "side_narrow"]
 LumberPurpose = Literal["ko_1", "ko_2", "otsu"]
 GradeLabel = Literal["1", "2", "3", "out"]
 
@@ -50,10 +52,15 @@ class Knot:
     width_max_pos: float
     width_min_pos: float
 
+    long_diam_length: float
+    long_diam_width: float
+    short_diam_length: float
+    short_diam_width: float
+
     center_point_length: float
     center_point_width: float
 
-    is_alive: bool = True
+    # is_alive: bool = True  #造作用の生き/死に。構造用は不要
 
     # ---- derived values ----
     length_max_pos_mm: Optional[float] = None
@@ -116,37 +123,27 @@ class Knot:
         self.width_min_pos_mm = self.width_min_pos * width_ratio
         self.center_point_length_mm = self.center_point_length * length_ratio
         self.center_point_width_mm = self.center_point_width * width_ratio
+        self.long_diam_length_mm = self.long_diam_length * length_ratio
+        self.long_diam_width_mm = self.long_diam_width * width_ratio
+        self.short_diam_length_mm = self.short_diam_length * length_ratio
+        self.short_diam_width_mm = self.short_diam_width * width_ratio
 
         self.length_mm = max(0.0, self.length_max_pos_mm - self.length_min_pos_mm)
         self.width_mm = max(0.0, self.width_max_pos_mm - self.width_min_pos_mm)
 
-        self._derive_long_short_diameter()
+        self._derive_long_short_diameter()  #要変更
         self._derive_jas_diameter()
         self.region = self._classify_region(surface_width_mm)
 
     def _derive_long_short_diameter(self) -> None:
-        """Approximate long/short diameters from the bounding-box size.
-
-        If more accurate long/short-diameter lines are available later, this
-        method can be replaced by a line-endpoint based calculation.
-        """
-        length = self.length_mm or 0.0
-        width = self.width_mm or 0.0
-
-        if length >= width:
-            self.long_diam_length_mm = length
-            self.long_diam_width_mm = 0.0
-            self.short_diam_length_mm = 0.0
-            self.short_diam_width_mm = width
-            self.long_diam_mm = length
-            self.short_diam_mm = width
-        else:
-            self.long_diam_length_mm = 0.0
-            self.long_diam_width_mm = width
-            self.short_diam_length_mm = length
-            self.short_diam_width_mm = 0.0
-            self.long_diam_mm = width
-            self.short_diam_mm = length
+        """Culculate long/short diameters."""
+        
+        long_length = self.long_diam_length_mm
+        long_width = self.long_diam_width_mm
+        short_length = self.short_diam_length_mm
+        short_width = self.short_diam_width_mm
+        self.long_diam_mm = math.sqrt(long_length ** 2 + long_width ** 2)
+        self.short_diam_mm = math.sqrt(short_length ** 2 + short_width ** 2)
 
     def _derive_jas_diameter(self) -> None:
         """Derive JAS knot diameter.
@@ -218,7 +215,7 @@ class Knot:
 
 
 @dataclass
-class Surface:
+class SideSurface:
     """One surface instance of a lumber."""
 
     # ---- constructor inputs ----
@@ -244,6 +241,8 @@ class Surface:
     max_center_knot_ratio: Optional[float] = None
 
     max_ck_member: list[str] = field(default_factory=list)
+    max_edge_ck_member: list[str] = field(default_factory=list)
+    max_center_ck_member: list[str] = field(default_factory=list)
     max_ckr: Optional[float] = None
     max_edge_ckr: Optional[float] = None
     max_center_ckr: Optional[float] = None
@@ -276,12 +275,11 @@ class Surface:
             raise ValueError("length_ratio and width_ratio must be derived first")
 
         for knot in self.knots:
-            if knot.is_alive:
-                knot.derive_features(
-                    length_ratio=self.length_ratio,
-                    width_ratio=self.width_ratio,
-                    surface_width_mm=self.width_mm,
-                )
+            knot.derive_features(
+                length_ratio=self.length_ratio,
+                width_ratio=self.width_ratio,
+                surface_width_mm=self.width_mm,
+            )
 
     def _derive_knot_ratio_features(self) -> None:
         max_all = (0.0, None)
@@ -289,19 +287,19 @@ class Surface:
         max_center = (0.0, None)
 
         for knot in self.knots:
-            if not knot.is_alive or knot.jas_diameter is None or knot.region is None:
+            if knot.jas_diameter is None or knot.region is None:
                 continue
 
             ratio = 100.0 * knot.jas_diameter / self.width_mm
+            if not ratio == 100.0:
+                if ratio > max_all[0]:
+                    max_all = (ratio, knot.knot_id)
 
-            if ratio > max_all[0]:
-                max_all = (ratio, knot.knot_id)
+                if knot.region in ("edge_upper", "edge_lower") and ratio > max_edge[0]:
+                    max_edge = (ratio, knot.knot_id)
 
-            if knot.region in ("edge_upper", "edge_lower") and ratio > max_edge[0]:
-                max_edge = (ratio, knot.knot_id)
-
-            if knot.region == "center" and ratio > max_center[0]:
-                max_center = (ratio, knot.knot_id)
+                if knot.region == "center" and ratio > max_center[0]:
+                    max_center = (ratio, knot.knot_id)
 
         self.max_knot_ratio, self.max_knot_id = max_all
         self.max_edge_knot_ratio, self.max_edge_knot_id = max_edge
@@ -310,13 +308,13 @@ class Surface:
     def _derive_concentrated_knot_features(self) -> None:
         max_all_ck_sum = 0.0
         max_all_ck_member: list[str] = []
+        max_edge_ck_member: list[str] = []
+        max_center_ck_member: list[str] = []
         max_edge_ck_sum = 0.0
         max_center_ck_sum = 0.0
 
         for base_knot in self.knots:
-            if not base_knot.is_alive:
-                continue
-
+            
             plus_window = self._make_plus_window(base_knot)
             minus_window = self._make_minus_window(base_knot)
 
@@ -349,12 +347,23 @@ class Surface:
             base_knot.ck_member_minus_regional = minus_regional_members
             base_knot.max_ck_regional = max(plus_regional_sum, minus_regional_sum)
 
+            if plus_regional_sum >= minus_regional_sum:
+                current__regional_members = plus_regional_members
+            else:
+                current_regional_members = minus_regional_members
+
             if base_knot.region in ("edge_upper", "edge_lower"):
-                max_edge_ck_sum = max(max_edge_ck_sum, base_knot.max_ck_regional)
+                if base_knot.max_ck_regional > max_edge_ck_sum:
+                    max_edge_ck_sum = base_knot.max_ck_regional
+                    max_edge_ck_member = current_regional_members
             elif base_knot.region == "center":
-                max_center_ck_sum = max(max_center_ck_sum, base_knot.max_ck_regional)
+                if base_knot.max_ck_regional > max_edge_ck_sum:
+                    max_center_ck_sum = base_knot.max_ck_regional
+                    max_center_ck_member = current_regional_members
 
         self.max_ck_member = max_all_ck_member
+        self.max_edge_ck_member = max_edge_ck_member
+        self.max_center_ck_member = max_center_ck_member
         self.max_ckr = 100.0 * max_all_ck_sum / self.width_mm
         self.max_edge_ckr = 100.0 * max_edge_ck_sum / self.width_mm
         self.max_center_ckr = 100.0 * max_center_ck_sum / self.width_mm
@@ -397,7 +406,7 @@ class Surface:
         member_ids: list[str] = []
 
         for knot in self.knots:
-            if not knot.is_alive or knot.jas_diameter is None:
+            if knot.jas_diameter is None:
                 continue
             if knot.length_min_pos_mm is None or knot.length_max_pos_mm is None:
                 continue
@@ -438,7 +447,7 @@ class Lumber:
     lumber_id: str
     lumber_length_mm: float
     lumber_purpose: LumberPurpose
-    surfaces: list[Surface] = field(default_factory=list)
+    side_surfaces: list[SideSurface] = field(default_factory=list)
 
     # ---- derived values ----
     wide_max_kr_surface_id: Optional[str] = None
@@ -467,13 +476,49 @@ class Lumber:
     grade: Optional[GradeLabel] = None
 
     def derive_features(self) -> None:
-        for surface in self.surfaces:
-            surface.derive_features(self.lumber_length_mm)
-        self.select_features()
+        self._assign_surface_classes()
 
-    def select_features(self) -> None:
-        wide_surfaces = [s for s in self.surfaces if s.surface_class == "side_wide"]
-        narrow_surfaces = [s for s in self.surfaces if s.surface_class == "side_narrow"]
+        for surface in self.side_surfaces:
+            surface.derive_features(self.lumber_length_mm)
+
+        self._derive_lumber_max_features()
+    #     self.select_features()
+
+    def _assign_surface_classes(self) -> None:
+        if not self.surfaces:
+            return
+
+        widths = [surface.width_mm for surface in self.surfaces]
+
+        max_width = max(widths)
+        min_width = min(widths)
+
+        if max_width == min_width:
+            for surface in self.surfaces:
+                surface.surface_class = "side_wide"
+            return
+
+        for surface in self.surfaces:
+            if surface.width_mm == max_width:
+                surface.surface_class = "side_wide"
+            elif surface.width_mm == min_width:
+                surface.surface_class = "side_narrow"
+            else:
+                raise ValueError(
+                    f"Unexpected surface width: {surface.width_mm}. "
+                    f"Only two side widths are expected: {min_width} and {max_width}."
+                )
+
+    def _derive_lumber_max_features() -> None:
+        wide_surfaces = [
+            surface for surface in self.surfaces
+            if surface.surface_class == "side_wide"
+        ]
+
+        narrow_surfaces = [
+            surface for surface in self.surfaces
+            if surface.surface_class == "side_narrow"
+        ]
 
         if not self.use_narrow_surface_rules:
             narrow_surfaces = []
@@ -482,14 +527,17 @@ class Lumber:
             wide_surfaces,
             "max_knot_ratio",
         )
+
         self.wide_edge_max_kr, self.wide_edge_max_kr_surface_id = self._max_surface_attr(
             wide_surfaces,
             "max_edge_knot_ratio",
         )
+
         self.wide_center_max_kr, self.wide_center_max_kr_surface_id = self._max_surface_attr(
             wide_surfaces,
             "max_center_knot_ratio",
         )
+
         self.narrow_max_kr, self.narrow_max_kr_surface_id = self._max_surface_attr(
             narrow_surfaces,
             "max_knot_ratio",
@@ -499,14 +547,17 @@ class Lumber:
             wide_surfaces,
             "max_ckr",
         )
+
         self.wide_edge_max_ckr, self.wide_edge_max_ckr_surface_id = self._max_surface_attr(
             wide_surfaces,
             "max_edge_ckr",
         )
+
         self.wide_center_max_ckr, self.wide_center_max_ckr_surface_id = self._max_surface_attr(
             wide_surfaces,
             "max_center_ckr",
         )
+
         self.narrow_max_ckr, self.narrow_max_ckr_surface_id = self._max_surface_attr(
             narrow_surfaces,
             "max_ckr",
@@ -514,7 +565,71 @@ class Lumber:
 
     def _max_surface_attr(
         self,
-        surfaces: Sequence[Surface],
+        surfaces: list[SideSurface],
+        attr_name: str,
+    ) -> tuple[float, Optional[str]]:
+        """
+        指定した材面属性の最大値と、その surface_id を返す。
+        """
+        max_value = 0.0
+        max_surface_id = None
+
+        for surface in surfaces:
+            value = getattr(surface, attr_name)
+
+            if value is None:
+                continue
+
+            if value > max_value:
+                max_value = value
+                max_surface_id = surface.surface_id
+
+        return max_value, max_surface_id
+
+    # def select_features(self) -> None:
+    #     wide_surfaces = [s for s in self.surfaces if s.surface_class == "side_wide"]
+    #     narrow_surfaces = [s for s in self.surfaces if s.surface_class == "side_narrow"]
+
+    #     if not self.use_narrow_surface_rules:
+    #         narrow_surfaces = []
+
+    #     self.wide_max_kr, self.wide_max_kr_surface_id = self._max_surface_attr(
+    #         wide_surfaces,
+    #         "max_knot_ratio",
+    #     )
+    #     self.wide_edge_max_kr, self.wide_edge_max_kr_surface_id = self._max_surface_attr(
+    #         wide_surfaces,
+    #         "max_edge_knot_ratio",
+    #     )
+    #     self.wide_center_max_kr, self.wide_center_max_kr_surface_id = self._max_surface_attr(
+    #         wide_surfaces,
+    #         "max_center_knot_ratio",
+    #     )
+    #     self.narrow_max_kr, self.narrow_max_kr_surface_id = self._max_surface_attr(
+    #         narrow_surfaces,
+    #         "max_knot_ratio",
+    #     )
+
+    #     self.wide_max_ckr, self.wide_max_ckr_surface_id = self._max_surface_attr(
+    #         wide_surfaces,
+    #         "max_ckr",
+    #     )
+    #     self.wide_edge_max_ckr, self.wide_edge_max_ckr_surface_id = self._max_surface_attr(
+    #         wide_surfaces,
+    #         "max_edge_ckr",
+    #     )
+    #     self.wide_center_max_ckr, self.wide_center_max_ckr_surface_id = self._max_surface_attr(
+    #         wide_surfaces,
+    #         "max_center_ckr",
+    #     )
+    #     self.narrow_max_ckr, self.narrow_max_ckr_surface_id = self._max_surface_attr(
+    #         narrow_surfaces,
+    #         "max_ckr",
+    #     )
+
+    def _max_surface_attr(
+        self,
+        surfaces: Sequence[SideSurface],
         attr_name: str,
     ) -> tuple[float, Optional[str]]:
         max_value = 0.0
