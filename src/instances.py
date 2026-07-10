@@ -136,7 +136,7 @@ class Knot:
         self.region = self._classify_region(surface_width_mm)
 
     def _derive_long_short_diameter(self) -> None:
-        """Culculate long/short diameters."""
+        """Calculate long/short diameters."""
         
         long_length = self.long_diam_length_mm
         long_width = self.long_diam_width_mm
@@ -291,15 +291,15 @@ class SideSurface:
                 continue
 
             ratio = 100.0 * knot.jas_diameter / self.width_mm
-            if not ratio == 100.0:
-                if ratio > max_all[0]:
-                    max_all = (ratio, knot.knot_id)
+            # if not ratio == 100.0:   #JAS1083第2部の4.2.1.1 板類及び角類の節の径 b) 「構造用製材及び下地用製材において，連続して隣接 2 材面又は 3 材面に存するものについては，節の 横断面のみを測定する」の実装例。詳しくは要質問
+            if ratio > max_all[0]:
+                max_all = (ratio, knot.knot_id)
 
-                if knot.region in ("edge_upper", "edge_lower") and ratio > max_edge[0]:
-                    max_edge = (ratio, knot.knot_id)
+            if knot.region in ("edge_upper", "edge_lower") and ratio > max_edge[0]:
+                max_edge = (ratio, knot.knot_id)
 
-                if knot.region == "center" and ratio > max_center[0]:
-                    max_center = (ratio, knot.knot_id)
+            if knot.region == "center" and ratio > max_center[0]:
+                max_center = (ratio, knot.knot_id)
 
         self.max_knot_ratio, self.max_knot_id = max_all
         self.max_edge_knot_ratio, self.max_edge_knot_id = max_edge
@@ -348,7 +348,7 @@ class SideSurface:
             base_knot.max_ck_regional = max(plus_regional_sum, minus_regional_sum)
 
             if plus_regional_sum >= minus_regional_sum:
-                current__regional_members = plus_regional_members
+                current_regional_members = plus_regional_members
             else:
                 current_regional_members = minus_regional_members
 
@@ -357,7 +357,7 @@ class SideSurface:
                     max_edge_ck_sum = base_knot.max_ck_regional
                     max_edge_ck_member = current_regional_members
             elif base_knot.region == "center":
-                if base_knot.max_ck_regional > max_edge_ck_sum:
+                if base_knot.max_ck_regional > max_center_ck_sum:
                     max_center_ck_sum = base_knot.max_ck_regional
                     max_center_ck_member = current_regional_members
 
@@ -476,6 +476,13 @@ class Lumber:
     grade: Optional[GradeLabel] = None
 
     def derive_features(self) -> None:
+        """
+        Derive lumber-level features.
+
+        1. Assign side_wide / side_narrow to each SideSurface based on SideSurface.width_mm.
+        2. Derive features for each SideSurface.
+        3. Aggregate maximum values at the lumber level.
+        """
         self._assign_surface_classes()
 
         for surface in self.side_surfaces:
@@ -485,20 +492,30 @@ class Lumber:
     #     self.select_features()
 
     def _assign_surface_classes(self) -> None:
-        if not self.surfaces:
+        """
+        Assign surface_class to each SideSurface based on SideSurface.width_mm.
+
+        - If all width_mm values are equal:
+            assign side_wide to all surfaces.
+
+        - If width_mm values are different:
+            assign side_wide to the surfaces with the maximum width_mm.
+            assign side_narrow to the surfaces with the minimum width_mm.
+        """
+        if not self.side_surfaces:
             return
 
-        widths = [surface.width_mm for surface in self.surfaces]
+        widths = [surface.width_mm for surface in self.side_surfaces]
 
         max_width = max(widths)
         min_width = min(widths)
 
         if max_width == min_width:
-            for surface in self.surfaces:
+            for surface in self.side_surfaces:
                 surface.surface_class = "side_wide"
             return
 
-        for surface in self.surfaces:
+        for surface in self.side_surfaces:
             if surface.width_mm == max_width:
                 surface.surface_class = "side_wide"
             elif surface.width_mm == min_width:
@@ -509,14 +526,17 @@ class Lumber:
                     f"Only two side widths are expected: {min_width} and {max_width}."
                 )
 
-    def _derive_lumber_max_features() -> None:
+    def _derive_lumber_max_features(self) -> None:
+        """
+        Aggregate lumber-level maximum values from surface-level features.
+        """
         wide_surfaces = [
-            surface for surface in self.surfaces
+            surface for surface in self.side_surfaces
             if surface.surface_class == "side_wide"
         ]
 
         narrow_surfaces = [
-            surface for surface in self.surfaces
+            surface for surface in self.side_surfaces
             if surface.surface_class == "side_narrow"
         ]
 
@@ -563,69 +583,6 @@ class Lumber:
             "max_ckr",
         )
 
-    def _max_surface_attr(
-        self,
-        surfaces: list[SideSurface],
-        attr_name: str,
-    ) -> tuple[float, Optional[str]]:
-        """
-        指定した材面属性の最大値と、その surface_id を返す。
-        """
-        max_value = 0.0
-        max_surface_id = None
-
-        for surface in surfaces:
-            value = getattr(surface, attr_name)
-
-            if value is None:
-                continue
-
-            if value > max_value:
-                max_value = value
-                max_surface_id = surface.surface_id
-
-        return max_value, max_surface_id
-
-    # def select_features(self) -> None:
-    #     wide_surfaces = [s for s in self.surfaces if s.surface_class == "side_wide"]
-    #     narrow_surfaces = [s for s in self.surfaces if s.surface_class == "side_narrow"]
-
-    #     if not self.use_narrow_surface_rules:
-    #         narrow_surfaces = []
-
-    #     self.wide_max_kr, self.wide_max_kr_surface_id = self._max_surface_attr(
-    #         wide_surfaces,
-    #         "max_knot_ratio",
-    #     )
-    #     self.wide_edge_max_kr, self.wide_edge_max_kr_surface_id = self._max_surface_attr(
-    #         wide_surfaces,
-    #         "max_edge_knot_ratio",
-    #     )
-    #     self.wide_center_max_kr, self.wide_center_max_kr_surface_id = self._max_surface_attr(
-    #         wide_surfaces,
-    #         "max_center_knot_ratio",
-    #     )
-    #     self.narrow_max_kr, self.narrow_max_kr_surface_id = self._max_surface_attr(
-    #         narrow_surfaces,
-    #         "max_knot_ratio",
-    #     )
-
-    #     self.wide_max_ckr, self.wide_max_ckr_surface_id = self._max_surface_attr(
-    #         wide_surfaces,
-    #         "max_ckr",
-    #     )
-    #     self.wide_edge_max_ckr, self.wide_edge_max_ckr_surface_id = self._max_surface_attr(
-    #         wide_surfaces,
-    #         "max_edge_ckr",
-    #     )
-    #     self.wide_center_max_ckr, self.wide_center_max_ckr_surface_id = self._max_surface_attr(
-    #         wide_surfaces,
-    #         "max_center_ckr",
-    #     )
-    #     self.narrow_max_ckr, self.narrow_max_ckr_surface_id = self._max_surface_attr(
-    #         narrow_surfaces,
-    #         "max_ckr",
-    #     )
 
     def _max_surface_attr(
         self,
@@ -645,52 +602,52 @@ class Lumber:
 
         return max_value, max_surface_id
 
-    def decide_grade(
-        self,
-        rules: Optional[dict[str, tuple[float, float, float]]] = None,
-    ) -> Optional[GradeLabel]:
-        """Decide grade from derived features.
+#     def decide_grade(
+#         self,
+#         rules: Optional[dict[str, tuple[float, float, float]]] = None,
+#     ) -> Optional[GradeLabel]:
+#         """Decide grade from derived features.
 
-        Parameters
-        ----------
-        rules:
-            Optional threshold dictionary. Keys should correspond to feature
-            names such as 'wide_edge_max_kr' or 'narrow_max_ckr'. Each value is
-            a tuple of thresholds for grade 1, grade 2, and grade 3.
+#         Parameters
+#         ----------
+#         rules:
+#             Optional threshold dictionary. Keys should correspond to feature
+#             names such as 'wide_edge_max_kr' or 'narrow_max_ckr'. Each value is
+#             a tuple of thresholds for grade 1, grade 2, and grade 3.
 
-        Returns
-        -------
-        Optional grade label. If rules is None, features are derived but grade
-        is left as None.
-        """
-        self.derive_features()
+#         Returns
+#         -------
+#         Optional grade label. If rules is None, features are derived but grade
+#         is left as None.
+#         """
+#         self.derive_features()
 
-        if rules is None:
-            self.grade = None
-            return self.grade
+#         if rules is None:
+#             self.grade = None
+#             return self.grade
 
-        component_grades: list[GradeLabel] = []
-        for feature_name, thresholds in rules.items():
-            value = getattr(self, feature_name)
-            if value is None:
-                continue
-            component_grades.append(_judge_leq_threshold(float(value), thresholds))
+#         component_grades: list[GradeLabel] = []
+#         for feature_name, thresholds in rules.items():
+#             value = getattr(self, feature_name)
+#             if value is None:
+#                 continue
+#             component_grades.append(_judge_leq_threshold(float(value), thresholds))
 
-        self.grade = _worst_grade(component_grades) if component_grades else None
-        return self.grade
-
-
-def _judge_leq_threshold(value: float, thresholds: tuple[float, float, float]) -> GradeLabel:
-    grade_1, grade_2, grade_3 = thresholds
-    if value <= grade_1:
-        return "1"
-    if value <= grade_2:
-        return "2"
-    if value <= grade_3:
-        return "3"
-    return "out"
+#         self.grade = _worst_grade(component_grades) if component_grades else None
+#         return self.grade
 
 
-def _worst_grade(grades: Sequence[GradeLabel]) -> GradeLabel:
-    rank = {"1": 1, "2": 2, "3": 3, "out": 4}
-    return max(grades, key=lambda grade: rank[grade])
+# def _judge_leq_threshold(value: float, thresholds: tuple[float, float, float]) -> GradeLabel:
+#     grade_1, grade_2, grade_3 = thresholds
+#     if value <= grade_1:
+#         return "1"
+#     if value <= grade_2:
+#         return "2"
+#     if value <= grade_3:
+#         return "3"
+#     return "out"
+
+
+# def _worst_grade(grades: Sequence[GradeLabel]) -> GradeLabel:
+#     rank = {"1": 1, "2": 2, "3": 3, "out": 4}
+#     return max(grades, key=lambda grade: rank[grade])
