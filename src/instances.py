@@ -25,7 +25,7 @@ from typing import Literal, Optional, Sequence
 import math
 
 
-KnotRegion = Literal["edge_upper", "edge_lower", "center"]
+KnotRegion = Literal["edge", "center"]
 SurfaceClass = Literal["side_wide", "side_narrow"]
 LumberPurpose = Literal["ko_1", "ko_2", "otsu"]
 GradeLabel = Literal["1", "2", "3", "out"]
@@ -165,22 +165,21 @@ class Knot:
         self.jas_diameter = raw_diameter * factor
 
     def _classify_region(self, surface_width_mm: float) -> KnotRegion:
-        """Classify the knot into lower edge, upper edge, or center.
+        """Classify this knot into edge or center based on its center position."""
+        lower_edge_boundary = surface_width_mm * 0.25
+        upper_edge_boundary = surface_width_mm * 0.75
 
-        edge_lower is the low-coordinate edge region, and edge_upper is the
-        high-coordinate edge region in the surface-width direction.
-        """
-        center_width = self.center_point_width_mm
-        if center_width is None:
-            raise ValueError("center_point_width_mm must be derived before region classification")
+        if self.center_point_width_mm is None:
+            raise ValueError(
+                f"center_point_width_mm has not been derived yet: {self.knot_id}"
+            )
 
-        lower_boundary = surface_width_mm * 0.25
-        upper_boundary = surface_width_mm * 0.75
+        if (
+            self.center_point_width_mm <= lower_edge_boundary
+            or self.center_point_width_mm >= upper_edge_boundary
+        ):
+            return "edge"
 
-        if center_width <= lower_boundary:
-            return "edge_lower"
-        if center_width >= upper_boundary:
-            return "edge_upper"
         return "center"
 
     def get_diameter(self) -> float:
@@ -295,7 +294,7 @@ class SideSurface:
             if ratio > max_all[0]:
                 max_all = (ratio, knot.knot_id)
 
-            if knot.region in ("edge_upper", "edge_lower") and ratio > max_edge[0]:
+            if knot.region == "edge" and ratio > max_edge[0]:
                 max_edge = (ratio, knot.knot_id)
 
             if knot.region == "center" and ratio > max_center[0]:
@@ -306,18 +305,28 @@ class SideSurface:
         self.max_center_knot_ratio, self.max_center_knot_id = max_center
 
     def _derive_concentrated_knot_features(self) -> None:
+        """Derive concentrated-knot features for this side surface.
+
+        For regional CKR:
+        - edge knots are summed together as one edge group.
+        - center knots are summed as the center group.
+        """
         max_all_ck_sum = 0.0
-        max_all_ck_member: list[str] = []
-        max_edge_ck_member: list[str] = []
-        max_center_ck_member: list[str] = []
         max_edge_ck_sum = 0.0
         max_center_ck_sum = 0.0
 
+        max_all_ck_member: list[str] = []
+        max_edge_ck_member: list[str] = []
+        max_center_ck_member: list[str] = []
+
         for base_knot in self.knots:
-            
+            if base_knot.region is None:
+                continue
+
             plus_window = self._make_plus_window(base_knot)
             minus_window = self._make_minus_window(base_knot)
 
+            # 全体の集中節候補
             plus_sum, plus_members = self._sum_window_members(plus_window)
             minus_sum, minus_members = self._sum_window_members(minus_window)
 
@@ -334,6 +343,9 @@ class SideSurface:
                 max_all_ck_sum = base_knot.max_ck
                 max_all_ck_member = current_members
 
+            # 材縁部/中央部ごとの集中節候補
+            # base_knot.region が "edge" なら、同じ 15cm 区間内の edge 節をすべて合計する。
+            # base_knot.region が "center" なら、同じ 15cm 区間内の center 節だけを合計する。
             plus_regional_sum, plus_regional_members = self._sum_window_members(
                 plus_window,
                 region=base_knot.region,
@@ -352,10 +364,11 @@ class SideSurface:
             else:
                 current_regional_members = minus_regional_members
 
-            if base_knot.region in ("edge_upper", "edge_lower"):
+            if base_knot.region == "edge":
                 if base_knot.max_ck_regional > max_edge_ck_sum:
                     max_edge_ck_sum = base_knot.max_ck_regional
                     max_edge_ck_member = current_regional_members
+
             elif base_knot.region == "center":
                 if base_knot.max_ck_regional > max_center_ck_sum:
                     max_center_ck_sum = base_knot.max_ck_regional
@@ -364,8 +377,10 @@ class SideSurface:
         self.max_ck_member = max_all_ck_member
         self.max_edge_ck_member = max_edge_ck_member
         self.max_center_ck_member = max_center_ck_member
+
         self.max_ckr = 100.0 * max_all_ck_sum / self.width_mm
         self.max_edge_ckr = 100.0 * max_edge_ck_sum / self.width_mm
+        self.max_center_ckr = 100.0 * max_center_ck_sum / self.width_mm
         self.max_center_ckr = 100.0 * max_center_ck_sum / self.width_mm
 
     def _make_plus_window(self, knot: Knot) -> tuple[float, float]:
@@ -395,12 +410,7 @@ class SideSurface:
         window: tuple[float, float],
         region: Optional[KnotRegion] = None,
     ) -> tuple[float, list[str]]:
-        """Sum JAS diameters of knots overlapping a window.
-
-        If region is specified, only knots in the same region are included.
-        This treats edge_upper and edge_lower as separate regions. If later you
-        decide to combine both edges, change this region filter.
-        """
+        """Sum JAS diameters of knots overlapping a window."""
         start, end = window
         diameter_sum = 0.0
         member_ids: list[str] = []
@@ -410,10 +420,12 @@ class SideSurface:
                 continue
             if knot.length_min_pos_mm is None or knot.length_max_pos_mm is None:
                 continue
+
             if region is not None and knot.region != region:
                 continue
 
             overlaps = knot.length_max_pos_mm >= start and knot.length_min_pos_mm <= end
+
             if overlaps:
                 diameter_sum += knot.jas_diameter
                 member_ids.append(knot.knot_id)
