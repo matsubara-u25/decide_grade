@@ -88,6 +88,20 @@ class Knot:
 
     region: Optional[KnotRegion] = None
 
+    # Concentrated-knot members for all knots.
+    ck_member_plus: list[str] = field(default_factory=list)
+    ck_member_minus: list[str] = field(default_factory=list)
+    max_ck: Optional[float] = None
+
+    # Concentrated-knot members for edge/center regional calculations.
+    ck_member_plus_edge: list[str] = field(default_factory=list)
+    ck_member_minus_edge: list[str] = field(default_factory=list)
+    ck_member_plus_center: list[str] = field(default_factory=list)
+    ck_member_minus_center: list[str] = field(default_factory=list)
+
+    max_ck_edge: Optional[float] = None
+    max_ck_center: Optional[float] = None
+
     # Concentrated-knot members for edge/center regional calculations.
     ck_member_plus_edge: list[str] = field(default_factory=list)
     ck_member_minus_edge: list[str] = field(default_factory=list)
@@ -301,107 +315,107 @@ class SideSurface:
         self.max_edge_knot_ratio, self.max_edge_knot_id = max_edge
         self.max_center_knot_ratio, self.max_center_knot_id = max_center
 
-        def _derive_concentrated_knot_features(self) -> None:
-            """Derive concentrated-knot features for this side surface.
+    def _derive_concentrated_knot_features(self) -> None:
+        """Derive concentrated-knot features for this side surface.
 
-            Rules implemented here:
-            - plus and minus windows are only candidate 150 mm windows.
-            They are not treated as separate final categories.
-            - Both edge sides are treated as one edge group.
-            - For regional CKR, membership is based on whether the knot area
-            overlaps edge/center regions, not only on the knot center.
-            """
-            max_all_ck_sum = 0.0
-            max_edge_ck_sum = 0.0
-            max_center_ck_sum = 0.0
+        Rules implemented here:
+        - plus and minus windows are only candidate 150 mm windows.
+        They are not treated as separate final categories.
+        - Both edge sides are treated as one edge group.
+        - For regional CKR, membership is based on whether the knot area
+        overlaps edge/center regions, not only on the knot center.
+        """
+        max_all_ck_sum = 0.0
+        max_edge_ck_sum = 0.0
+        max_center_ck_sum = 0.0
 
-            max_all_ck_member: list[str] = []
-            max_edge_ck_member: list[str] = []
-            max_center_ck_member: list[str] = []
+        max_all_ck_member: list[str] = []
+        max_edge_ck_member: list[str] = []
+        max_center_ck_member: list[str] = []
 
-            for base_knot in self.knots:
-                plus_window = self._make_plus_window(base_knot)
-                minus_window = self._make_minus_window(base_knot)
+        for base_knot in self.knots:
+            plus_window = self._make_plus_window(base_knot)
+            minus_window = self._make_minus_window(base_knot)
 
-                # ---- all-region CKR ----
-                plus_sum, plus_members = self._sum_window_members(plus_window)
-                minus_sum, minus_members = self._sum_window_members(minus_window)
+            # ---- all-region CKR ----
+            plus_sum, plus_members = self._sum_window_members(plus_window)
+            minus_sum, minus_members = self._sum_window_members(minus_window)
 
-                base_knot.ck_member_plus = plus_members
-                base_knot.ck_member_minus = minus_members
-                base_knot.max_ck = max(plus_sum, minus_sum)
+            base_knot.ck_member_plus = plus_members
+            base_knot.ck_member_minus = minus_members
+            base_knot.max_ck = max(plus_sum, minus_sum)
 
-                if plus_sum >= minus_sum:
-                    current_members = plus_members
-                else:
-                    current_members = minus_members
+            if plus_sum >= minus_sum:
+                current_members = plus_members
+            else:
+                current_members = minus_members
 
-                if base_knot.max_ck > max_all_ck_sum:
-                    max_all_ck_sum = base_knot.max_ck
-                    max_all_ck_member = current_members
+            if base_knot.max_ck > max_all_ck_sum:
+                max_all_ck_sum = base_knot.max_ck
+                max_all_ck_member = current_members
 
-                # ---- edge CKR ----
-                plus_edge_sum, plus_edge_members = self._sum_window_members(
-                    plus_window,
-                    region="edge",
-                )
-                minus_edge_sum, minus_edge_members = self._sum_window_members(
-                    minus_window,
-                    region="edge",
-                )
+            # ---- edge CKR ----
+            plus_edge_sum, plus_edge_members = self._sum_window_members(
+                plus_window,
+                region="edge",
+            )
+            minus_edge_sum, minus_edge_members = self._sum_window_members(
+                minus_window,
+                region="edge",
+            )
 
-                base_knot.ck_member_plus_edge = plus_edge_members
-                base_knot.ck_member_minus_edge = minus_edge_members
-                base_knot.max_ck_edge = max(plus_edge_sum, minus_edge_sum)
+            base_knot.ck_member_plus_edge = plus_edge_members
+            base_knot.ck_member_minus_edge = minus_edge_members
+            base_knot.max_ck_edge = max(plus_edge_sum, minus_edge_sum)
 
-                if plus_edge_sum >= minus_edge_sum:
-                    current_edge_members = plus_edge_members
-                else:
-                    current_edge_members = minus_edge_members
+            if plus_edge_sum >= minus_edge_sum:
+                current_edge_members = plus_edge_members
+            else:
+                current_edge_members = minus_edge_members
 
-                if base_knot.max_ck_edge > max_edge_ck_sum:
-                    max_edge_ck_sum = base_knot.max_ck_edge
-                    max_edge_ck_member = current_edge_members
+            if base_knot.max_ck_edge > max_edge_ck_sum:
+                max_edge_ck_sum = base_knot.max_ck_edge
+                max_edge_ck_member = current_edge_members
 
-                # ---- center CKR ----
-                plus_center_sum, plus_center_members = self._sum_window_members(
-                    plus_window,
-                    region="center",
-                )
-                minus_center_sum, minus_center_members = self._sum_window_members(
-                    minus_window,
-                    region="center",
-                )
+            # ---- center CKR ----
+            plus_center_sum, plus_center_members = self._sum_window_members(
+                plus_window,
+                region="center",
+            )
+            minus_center_sum, minus_center_members = self._sum_window_members(
+                minus_window,
+                region="center",
+            )
 
-                base_knot.ck_member_plus_center = plus_center_members
-                base_knot.ck_member_minus_center = minus_center_members
-                base_knot.max_ck_center = max(plus_center_sum, minus_center_sum)
+            base_knot.ck_member_plus_center = plus_center_members
+            base_knot.ck_member_minus_center = minus_center_members
+            base_knot.max_ck_center = max(plus_center_sum, minus_center_sum)
 
-                if plus_center_sum >= minus_center_sum:
-                    current_center_members = plus_center_members
-                else:
-                    current_center_members = minus_center_members
+            if plus_center_sum >= minus_center_sum:
+                current_center_members = plus_center_members
+            else:
+                current_center_members = minus_center_members
 
-                if base_knot.max_ck_center > max_center_ck_sum:
-                    max_center_ck_sum = base_knot.max_ck_center
-                    max_center_ck_member = current_center_members
+            if base_knot.max_ck_center > max_center_ck_sum:
+                max_center_ck_sum = base_knot.max_ck_center
+                max_center_ck_member = current_center_members
 
-            self.max_ck_member = max_all_ck_member
-            self.max_edge_ck_member = max_edge_ck_member
-            self.max_center_ck_member = max_center_ck_member
+        self.max_ck_member = max_all_ck_member
+        self.max_edge_ck_member = max_edge_ck_member
+        self.max_center_ck_member = max_center_ck_member
 
-            self.max_ckr = 100.0 * max_all_ck_sum / self.width_mm
-            self.max_edge_ckr = 100.0 * max_edge_ck_sum / self.width_mm
-            self.max_center_ckr = 100.0 * max_center_ck_sum / self.width_mm
+        self.max_ckr = 100.0 * max_all_ck_sum / self.width_mm
+        self.max_edge_ckr = 100.0 * max_edge_ck_sum / self.width_mm
+        self.max_center_ckr = 100.0 * max_center_ck_sum / self.width_mm
 
-            self.max_ck_member = max_all_ck_member
-            self.max_edge_ck_member = max_edge_ck_member
-            self.max_center_ck_member = max_center_ck_member
+        self.max_ck_member = max_all_ck_member
+        self.max_edge_ck_member = max_edge_ck_member
+        self.max_center_ck_member = max_center_ck_member
 
-            self.max_ckr = 100.0 * max_all_ck_sum / self.width_mm
-            self.max_edge_ckr = 100.0 * max_edge_ck_sum / self.width_mm
-            self.max_center_ckr = 100.0 * max_center_ck_sum / self.width_mm
-            self.max_center_ckr = 100.0 * max_center_ck_sum / self.width_mm
+        self.max_ckr = 100.0 * max_all_ck_sum / self.width_mm
+        self.max_edge_ckr = 100.0 * max_edge_ck_sum / self.width_mm
+        self.max_center_ckr = 100.0 * max_center_ck_sum / self.width_mm
+        self.max_center_ckr = 100.0 * max_center_ck_sum / self.width_mm
 
     def _make_plus_window(self, knot: Knot) -> tuple[float, float]:
         """Window whose left end just includes knot.length_max_pos_mm."""
@@ -425,88 +439,88 @@ class SideSurface:
         end = start + self.window_length
         return start, end
 
-        def _sum_window_members(
-            self,
-            window: tuple[float, float],
-            region: Optional[KnotRegion] = None,
-        ) -> tuple[float, list[str]]:
-            """Sum JAS diameters of knots overlapping a 150 mm window.
+    def _sum_window_members(
+        self,
+        window: tuple[float, float],
+        region: Optional[KnotRegion] = None,
+    ) -> tuple[float, list[str]]:
+        """Sum JAS diameters of knots overlapping a 150 mm window.
 
-            If region is None:
-                Sum all knots overlapping the window.
+        If region is None:
+            Sum all knots overlapping the window.
 
-            If region == "edge":
-                Sum knots whose area overlaps either edge region.
-                The two edge regions are not distinguished.
+        If region == "edge":
+            Sum knots whose area overlaps either edge region.
+            The two edge regions are not distinguished.
 
-            If region == "center":
-                Sum knots whose area overlaps the center region.
-                A knot is included even if its center/pith is in the edge region.
-            """
-            start, end = window
-            diameter_sum = 0.0
-            member_ids: list[str] = []
+        If region == "center":
+            Sum knots whose area overlaps the center region.
+            A knot is included even if its center/pith is in the edge region.
+        """
+        start, end = window
+        diameter_sum = 0.0
+        member_ids: list[str] = []
 
-            for knot in self.knots:
-                if knot.jas_diameter is None:
-                    continue
-                if knot.length_min_pos_mm is None or knot.length_max_pos_mm is None:
-                    continue
+        for knot in self.knots:
+            if knot.jas_diameter is None:
+                continue
+            if knot.length_min_pos_mm is None or knot.length_max_pos_mm is None:
+                continue
 
-                overlaps_length_window = (
-                    knot.length_max_pos_mm >= start
-                    and knot.length_min_pos_mm <= end
-                )
+            overlaps_length_window = (
+                knot.length_max_pos_mm >= start
+                and knot.length_min_pos_mm <= end
+            )
 
-                if not overlaps_length_window:
-                    continue
+            if not overlaps_length_window:
+                continue
 
-                if region is not None and not self._knot_overlaps_region(knot, region):
-                    continue
+            if region is not None and not self._knot_overlaps_region(knot, region):
+                continue
 
-                diameter_sum += knot.jas_diameter
-                member_ids.append(knot.knot_id)
+            diameter_sum += knot.jas_diameter
+            member_ids.append(knot.knot_id)
 
-            return diameter_sum, member_ids
+        return diameter_sum, member_ids
 
-        def _knot_overlaps_region(
-            self,
-            knot: Knot,
-            region: KnotRegion,
-        ) -> bool:
-            """Return whether a knot area overlaps edge or center region.
+    def _knot_overlaps_region(
+        self,
+        knot: Knot,
+        region: KnotRegion,
+    ) -> bool:
+        """Return whether a knot area overlaps edge or center region.
 
-            Edge region:
-                width <= 1/4 W or width >= 3/4 W
+        Edge region:
+            width <= 1/4 W or width >= 3/4 W
 
-            Center region:
-                1/4 W <= width <= 3/4 W
+        Center region:
+            1/4 W <= width <= 3/4 W
 
-            This function uses the knot area, not the knot center.
-            Therefore, a knot whose center is in the edge region can still be
-            included in center CKR if its area overlaps the center region.
-            """
-            if knot.width_min_pos_mm is None or knot.width_max_pos_mm is None:
-                raise ValueError(
-                    f"knot width positions must be derived first: {knot.knot_id}"
-                )
+        This function uses the knot area, not the knot center.
+        Therefore, a knot whose center is in the edge region can still be
+        included in center CKR if its area overlaps the center region.
+        """
+        if knot.width_min_pos_mm is None or knot.width_max_pos_mm is None:
+            raise ValueError(
+                f"knot width positions must be derived first: {knot.knot_id}"
+            )
 
-            lower_edge_boundary = self.width_mm * 0.25
-            upper_edge_boundary = self.width_mm * 0.75
+        lower_edge_boundary = self.width_mm * 0.25
+        upper_edge_boundary = self.width_mm * 0.75
 
-            if region == "edge":
-                return (
-                    knot.width_min_pos_mm <= lower_edge_boundary
-                    or knot.width_max_pos_mm >= upper_edge_boundary
-                )
+        if region == "edge":
+            return (
+                knot.width_min_pos_mm <= lower_edge_boundary
+                or knot.width_max_pos_mm >= upper_edge_boundary
+            )
 
-            if region == "center":
-                return (
-                    knot.width_max_pos_mm >= lower_edge_boundary
-                    and knot.width_min_pos_mm <= upper_edge_boundary
-                )
+        if region == "center":
+            return (
+                knot.width_max_pos_mm >= lower_edge_boundary
+                and knot.width_min_pos_mm <= upper_edge_boundary
+            )
 
-            raise ValueError(f"Unknown region: {region}")
+        raise ValueError(f"Unknown region: {region}")
 
     def get_max_knot_ratio(self) -> float:
         return self.max_knot_ratio or 0.0
