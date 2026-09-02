@@ -102,15 +102,6 @@ class Knot:
     max_ck_edge: Optional[float] = None
     max_ck_center: Optional[float] = None
 
-    # Concentrated-knot members for edge/center regional calculations.
-    ck_member_plus_edge: list[str] = field(default_factory=list)
-    ck_member_minus_edge: list[str] = field(default_factory=list)
-    ck_member_plus_center: list[str] = field(default_factory=list)
-    ck_member_minus_center: list[str] = field(default_factory=list)
-
-    max_ck_edge: Optional[float] = None
-    max_ck_center: Optional[float] = None
-
     def derive_features(
         self,
         length_ratio: float,
@@ -408,14 +399,6 @@ class SideSurface:
         self.max_edge_ckr = 100.0 * max_edge_ck_sum / self.width_mm
         self.max_center_ckr = 100.0 * max_center_ck_sum / self.width_mm
 
-        self.max_ck_member = max_all_ck_member
-        self.max_edge_ck_member = max_edge_ck_member
-        self.max_center_ck_member = max_center_ck_member
-
-        self.max_ckr = 100.0 * max_all_ck_sum / self.width_mm
-        self.max_edge_ckr = 100.0 * max_edge_ck_sum / self.width_mm
-        self.max_center_ckr = 100.0 * max_center_ck_sum / self.width_mm
-        self.max_center_ckr = 100.0 * max_center_ck_sum / self.width_mm
 
     def _make_plus_window(self, knot: Knot) -> tuple[float, float]:
         """Window whose left end just includes knot.length_max_pos_mm."""
