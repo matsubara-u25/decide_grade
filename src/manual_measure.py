@@ -651,7 +651,22 @@ class ManualMeasureApp:
         canvas_frame.rowconfigure(0, weight=1)
         canvas_frame.columnconfigure(0, weight=1)
 
+        # Left click: add polygon / ellipse-fit points
         self.canvas.bind("<Button-1>", self._on_left_click)
+
+        # Ctrl + mouse wheel: zoom in/out
+        self.canvas.bind("<Control-MouseWheel>", self._on_ctrl_mousewheel)
+
+        # For Linux environments
+        self.canvas.bind("<Control-Button-4>", lambda event: self._zoom_at_event(event, 1.25))
+        self.canvas.bind("<Control-Button-5>", lambda event: self._zoom_at_event(event, 0.8))
+
+        # Right click + drag: pan image
+        self.canvas.bind("<ButtonPress-3>", self._start_pan)
+        self.canvas.bind("<B3-Motion>", self._do_pan)
+        self.canvas.bind("<ButtonRelease-3>", self._end_pan)
+
+
 
         self.root.update_idletasks()
         self._fit_to_window()
@@ -671,6 +686,83 @@ class ManualMeasureApp:
 
         self.scale = min(1.0, max(0.05, min(scale_w, scale_h)))
         self._render_image()
+
+
+    def _on_ctrl_mousewheel(self, event: tk.Event) -> str:
+        """Zoom in/out by Ctrl + mouse wheel."""
+        if event.delta > 0:
+            factor = 1.25
+        else:
+            factor = 0.8
+
+        self._zoom_at_event(event, factor)
+        return "break"
+
+
+    def _zoom_at_event(self, event: tk.Event, factor: float) -> str:
+        """Zoom around the mouse cursor position."""
+        if self.canvas is None or self.image_rgb is None:
+            return "break"
+
+        old_scale = self.scale
+
+        # Cursor position in canvas coordinates before zoom
+        canvas_x = self.canvas.canvasx(event.x)
+        canvas_y = self.canvas.canvasy(event.y)
+
+        # Corresponding image coordinates before zoom
+        image_x = canvas_x / old_scale
+        image_y = canvas_y / old_scale
+
+        # Update scale
+        self.scale = max(0.03, min(8.0, self.scale * factor))
+
+        # Re-render image and overlays
+        self._render_image()
+
+        # New canvas coordinates of the same image point
+        new_canvas_x = image_x * self.scale
+        new_canvas_y = image_y * self.scale
+
+        canvas_width = max(self.canvas.winfo_width(), 1)
+        canvas_height = max(self.canvas.winfo_height(), 1)
+
+        total_width = max(self.image_width_px * self.scale, 1)
+        total_height = max(self.image_height_px * self.scale, 1)
+
+        # Move viewport so that the zoom center stays near the cursor
+        left = new_canvas_x - event.x
+        top = new_canvas_y - event.y
+
+        left = max(0.0, min(left, max(total_width - canvas_width, 0.0)))
+        top = max(0.0, min(top, max(total_height - canvas_height, 0.0)))
+
+        if total_width > canvas_width:
+            self.canvas.xview_moveto(left / total_width)
+
+        if total_height > canvas_height:
+            self.canvas.yview_moveto(top / total_height)
+
+        return "break"
+
+
+    def _start_pan(self, event: tk.Event) -> str:
+        """Start panning by right mouse drag."""
+        if self.canvas is not None:
+            self.canvas.scan_mark(event.x, event.y)
+        return "break"
+
+
+    def _do_pan(self, event: tk.Event) -> str:
+        """Pan image by right mouse drag."""
+        if self.canvas is not None:
+            self.canvas.scan_dragto(event.x, event.y, gain=1)
+        return "break"
+
+
+    def _end_pan(self, event: tk.Event) -> str:
+        """End panning."""
+        return "break"
 
     def _change_zoom(self, factor: float) -> None:
         self.scale = max(0.03, min(5.0, self.scale * factor))
@@ -760,6 +852,9 @@ class ManualMeasureApp:
                 tags=("overlay",),
             )
 
+        # Temporary ellipse preview
+        self._draw_current_ellipse_preview()
+
     def _draw_detail_overlay(self, detail: dict[str, object]) -> None:
         if self.canvas is None:
             return
@@ -797,6 +892,11 @@ class ManualMeasureApp:
 
             self.canvas.create_line(*long_p1, *long_p2, fill="blue", width=2, tags=("overlay",))
             self.canvas.create_line(*short_p1, *short_p2, fill="yellow", width=2, tags=("overlay",))
+            self._draw_ellipse_on_canvas(
+                ellipse,
+                color="lime",
+                width=2,
+            )
             self.canvas.create_oval(cx - 3, cy - 3, cx + 3, cy + 3, fill="white", tags=("overlay",))
             self.canvas.create_text(
                 cx + 12,
@@ -967,6 +1067,106 @@ class ManualMeasureApp:
 
         self.status_var.set(f"Removed {removed.get('knot_id')}.")
         self._redraw_overlay()
+
+    def _draw_ellipse_on_canvas(
+        self,
+        ellipse: dict[str, object],
+        *,
+        color: str = "lime",
+        width: int = 2,
+        dash: tuple[int, int] | None = None,
+    ) -> None:
+        """Draw a rotated ellipse on the canvas as a polyline."""
+        if self.canvas is None:
+            return
+
+        try:
+            center = ellipse["center"]
+            long_ep = ellipse["long_axis_endpoints"]
+            short_ep = ellipse["short_axis_endpoints"]
+
+            cx = float(center[0])
+            cy = float(center[1])
+
+            long_p1 = (float(long_ep[0][0]), float(long_ep[0][1]))
+            long_p2 = (float(long_ep[1][0]), float(long_ep[1][1]))
+
+            short_p1 = (float(short_ep[0][0]), float(short_ep[0][1]))
+            short_p2 = (float(short_ep[1][0]), float(short_ep[1][1]))
+
+            # Half-axis vectors
+            long_vx = (long_p2[0] - long_p1[0]) / 2.0
+            long_vy = (long_p2[1] - long_p1[1]) / 2.0
+
+            short_vx = (short_p2[0] - short_p1[0]) / 2.0
+            short_vy = (short_p2[1] - short_p1[1]) / 2.0
+
+            canvas_points: list[float] = []
+
+            num_points = 120
+            for i in range(num_points + 1):
+                t = 2.0 * math.pi * i / num_points
+
+                x = cx + math.cos(t) * long_vx + math.sin(t) * short_vx
+                y = cy + math.cos(t) * long_vy + math.sin(t) * short_vy
+
+                sx, sy = self._image_to_canvas((x, y))
+                canvas_points.extend([sx, sy])
+
+            kwargs = {
+                "fill": color,
+                "width": width,
+                "smooth": True,
+                "tags": ("overlay",),
+            }
+
+            if dash is not None:
+                kwargs["dash"] = dash
+
+            self.canvas.create_line(*canvas_points, **kwargs)
+
+        except Exception:
+            return
+
+
+    def _draw_current_ellipse_preview(self) -> None:
+        """Draw temporary ellipse preview for the current knot."""
+        if self.canvas is None:
+            return
+
+        if not self.current_polygon_closed:
+            return
+
+        try:
+            if self.selected_arc_mode_var.get():
+                if len(self.current_fit_points) < 5:
+                    return
+
+                fit_points = self.current_fit_points[:]
+                fit_method = "selected_arc_fit_preview"
+
+            else:
+                if len(self.current_polygon) < 3:
+                    return
+
+                fit_points = densify_polyline(
+                    self.current_polygon,
+                    closed=True,
+                    step=AUTO_DENSIFY_STEP_PX,
+                )
+                fit_method = "fit_ellipse_preview"
+
+            ellipse = fit_ellipse_from_points(fit_points, fit_method)
+
+            self._draw_ellipse_on_canvas(
+                ellipse,
+                color="lime",
+                width=2,
+                dash=(5, 3),
+            )
+
+        except Exception:
+            return
 
     # -------------------------------------------------------------------------
     # Surface operations
