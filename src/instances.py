@@ -42,25 +42,27 @@ EPSILON_MM = 1e-6
 class Knot:
     """One knot instance on a surface."""
 
-    # ---- constructor inputs ----
+    # ----    constructor inputs    ----
+    # ----            id            ----
     knot_id: str
     lumber_id: str
     surface_id: str
 
-    length_max_pos: float
-    length_min_pos: float
-    width_max_pos: float
-    width_min_pos: float
+    # ----  position(max/min)[px]   ----
+    length_max_pos: float   
+    length_min_pos: float   
+    width_max_pos: float    
+    width_min_pos: float    
 
-    long_diam_length: float
-    long_diam_width: float
+    # ---- diameter(long/short)[px] ----
+    long_diam_length: float 
+    long_diam_width: float  
     short_diam_length: float
-    short_diam_width: float
+    short_diam_width: float 
 
+    # ----     center point[px]     ----
     center_point_length: float
     center_point_width: float
-
-    # is_alive: bool = True  #造作用の生き/死に。構造用は不要
 
     # ---- derived values ----
     length_max_pos_mm: Optional[float] = None
@@ -133,7 +135,7 @@ class Knot:
         self.length_mm = max(0.0, self.length_max_pos_mm - self.length_min_pos_mm)
         self.width_mm = max(0.0, self.width_max_pos_mm - self.width_min_pos_mm)
 
-        self._derive_long_short_diameter()  #要変更
+        self._derive_long_short_diameter()  
         self._derive_jas_diameter()
         self.region = self._classify_region(surface_width_mm)
 
