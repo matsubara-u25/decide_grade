@@ -1,79 +1,51 @@
-"""
-manual_measure.py
-
-Interactive manual measurement tool for surface images of sawn lumber.
-
-Default input directory:
-    decide_grade/data/images/wood_joined_cropped/
-
-Default outputs:
-    decide_grade/data/input/surface_info.csv
-    decide_grade/data/annotations/manual_measure/knot_measurements.csv
-    decide_grade/data/annotations/manual_measure/annotation_detail.jsonl
-    decide_grade/data/annotations/manual_measure/preview/
-
-Controls
---------
-Left click:
-    Add a polygon point, or add an ellipse-fit point in fit-point mode.
-
-Left click near the first polygon point:
-    Close the polygon and fit an ellipse automatically.
-
-Right click or u:
-    Undo the last point in the current mode.
-
-Enter:
-    - polygon mode: close polygon if it has 3 or more points
-    - fit mode: fit ellipse from selected fit points
-    - review mode: save the current knot
-
-f:
-    In review mode, select only the elliptical arc points to refit the ellipse.
-    Use this for truncated knots whose boundary includes a straight cut line.
-
-a:
-    In review mode, fit the ellipse again using the polygon boundary.
-
-s:
-    Save the current knot in review mode.
-
-r:
-    Reset the current unsaved knot.
-
-n / p:
-    Next / previous image.
-
-h / j / k / l:
-    Pan left / down / up / right.
-
-+ or = / -:
-    Zoom in / out.
-
-0:
-    Fit the full image to the display window.
-
-q or Esc:
-    Quit.
-"""
+# manual_measure.py
 
 from __future__ import annotations
 
-import argparse
 import csv
 import json
-from dataclasses import dataclass, asdict
+import math
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
 
 import cv2
 import numpy as np
+from PIL import Image, ImageTk
 
 
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+# =============================================================================
+# Paths
+# =============================================================================
 
-KNOT_CSV_COLUMNS = [
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+IMAGE_DIR = PROJECT_ROOT / "data" / "images" 
+SURFACE_INFO_PATH = PROJECT_ROOT / "data" / "input" / "surface_info.csv"
+
+ANNOTATION_DIR = PROJECT_ROOT / "data" / "annotations" / "manual_measure"
+KNOT_MEASUREMENTS_PATH = ANNOTATION_DIR / "knot_measurements.csv"
+ANNOTATION_DETAIL_PATH = ANNOTATION_DIR / "annotation_detail.jsonl"
+PREVIEW_DIR = ANNOTATION_DIR / "preview"
+
+
+# =============================================================================
+# CSV columns
+# =============================================================================
+
+SURFACE_INFO_COLUMNS = [
+    "lumber_id",
+    "surface_id",
+    "image_file",
+    "surface_width_mm",
+    "lumber_length_mm",
+    "length_px",
+    "width_px",
+    "created_at",
+]
+
+KNOT_MEASUREMENT_COLUMNS = [
     "lumber_id",
     "surface_id",
     "knot_id",
@@ -89,888 +61,1011 @@ KNOT_CSV_COLUMNS = [
     "short_diam_length",
     "short_diam_width",
     "ellipse_method",
-]
-
-SURFACE_INFO_COLUMNS = [
-    "lumber_id",
-    "surface_id",
-    "image_file",
-    "surface_width_mm",
-    "lumber_length_mm",
-    "length_px",
-    "width_px",
+    "is_truncated",
+    "created_at",
 ]
 
 
-@dataclass
-class SurfaceInfo:
-    lumber_id: str
-    surface_id: str
-    image_file: str
-    surface_width_mm: str
-    lumber_length_mm: str
-    length_px: int
-    width_px: int
+# =============================================================================
+# Constants
+# =============================================================================
+
+CLOSE_POINT_RADIUS_SCREEN_PX = 12
+POLYGON_POINT_RADIUS = 4
+FIT_POINT_RADIUS = 4
+
+AUTO_DENSIFY_STEP_PX = 2.0
 
 
-@dataclass
-class EllipseResult:
-    method: str
-    center: tuple[float, float]
-    long_axis_endpoints: tuple[tuple[float, float], tuple[float, float]]
-    short_axis_endpoints: tuple[tuple[float, float], tuple[float, float]]
-    long_diam_length: float
-    long_diam_width: float
-    short_diam_length: float
-    short_diam_width: float
-    angle_deg: float
-    long_diam_px: float
-    short_diam_px: float
+# =============================================================================
+# Utilities
+# =============================================================================
+
+def ensure_dirs() -> None:
+    for path in [
+        IMAGE_DIR,
+        SURFACE_INFO_PATH.parent,
+        ANNOTATION_DIR,
+        PREVIEW_DIR,
+    ]:
+        path.mkdir(parents=True, exist_ok=True)
 
 
-@dataclass
-class AnnotationRecord:
-    lumber_id: str
-    surface_id: str
-    knot_id: str
-    image_file: str
-    polygon_points: list[list[float]]
-    ellipse_fit_points: list[list[float]]
-    ellipse_method: str
-    bbox: dict[str, float]
-    ellipse: dict[str, object]
-    created_at: str
-    comment: str = ""
+def now_string() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def project_root_from_this_file() -> Path:
-    # If this file is placed at decide_grade/src/manual_measure.py,
-    # parents[1] is decide_grade/.
-    return Path(__file__).resolve().parents[1]
-
-
-def relpath_string(path: Path, base: Path) -> str:
+def path_to_storable_string(path: Path) -> str:
+    """Store a path relative to the project root if possible."""
     try:
-        return path.resolve().relative_to(base.resolve()).as_posix()
+        return str(path.resolve().relative_to(PROJECT_ROOT.resolve())).replace("\\", "/")
     except ValueError:
-        return path.resolve().as_posix()
+        return str(path.resolve())
 
 
-def parse_optional_float(value: str) -> str:
-    value = value.strip()
-    if not value:
-        return ""
-    return str(float(value))
+def read_image_bgr(path: Path) -> np.ndarray:
+    """Read image with Japanese/Unicode path support."""
+    data = np.fromfile(str(path), dtype=np.uint8)
+    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+
+    if image is None:
+        raise ValueError(f"Failed to read image: {path}")
+
+    return image
 
 
-def ensure_csv_header(path: Path, columns: list[str]) -> None:
-    if path.exists() and path.stat().st_size > 0:
-        return
+def write_image(path: Path, image_bgr: np.ndarray) -> None:
+    """Write image with Japanese/Unicode path support."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=columns)
-        writer.writeheader()
+    suffix = path.suffix if path.suffix else ".png"
+    success, buffer = cv2.imencode(suffix, image_bgr)
+
+    if not success:
+        raise ValueError(f"Failed to encode image: {path}")
+
+    buffer.tofile(str(path))
 
 
-def append_csv_row(path: Path, columns: list[str], row: dict[str, object]) -> None:
-    ensure_csv_header(path, columns)
+def append_csv_rows(path: Path, columns: list[str], rows: list[dict[str, object]]) -> None:
+    if not rows:
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not path.exists() or path.stat().st_size == 0
+
     with path.open("a", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=columns)
-        writer.writerow({col: row.get(col, "") for col in columns})
+
+        if write_header:
+            writer.writeheader()
+
+        for row in rows:
+            writer.writerow({column: row.get(column, "") for column in columns})
 
 
-def append_jsonl(path: Path, record: dict[str, object]) -> None:
+def upsert_surface_info(row: dict[str, object]) -> None:
+    """Insert or replace one surface_info row by lumber_id + surface_id."""
+    SURFACE_INFO_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    rows: list[dict[str, str]] = []
+
+    if SURFACE_INFO_PATH.exists() and SURFACE_INFO_PATH.stat().st_size > 0:
+        with SURFACE_INFO_PATH.open("r", newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+
+    lumber_id = str(row["lumber_id"])
+    surface_id = str(row["surface_id"])
+
+    rows = [
+        existing
+        for existing in rows
+        if not (
+            existing.get("lumber_id") == lumber_id
+            and existing.get("surface_id") == surface_id
+        )
+    ]
+
+    rows.append({column: str(row.get(column, "")) for column in SURFACE_INFO_COLUMNS})
+
+    with SURFACE_INFO_PATH.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=SURFACE_INFO_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def append_jsonl(path: Path, records: list[dict[str, object]]) -> None:
+    if not records:
+        return
+
     path.parent.mkdir(parents=True, exist_ok=True)
+
     with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def read_existing_knot_counts(knot_csv_path: Path) -> dict[tuple[str, str], int]:
-    counts: dict[tuple[str, str], int] = {}
-    if not knot_csv_path.exists():
-        return counts
+def count_existing_knots(lumber_id: str, surface_id: str) -> int:
+    if not KNOT_MEASUREMENTS_PATH.exists():
+        return 0
 
-    with knot_csv_path.open("r", newline="", encoding="utf-8-sig") as f:
+    count = 0
+
+    with KNOT_MEASUREMENTS_PATH.open("r", newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
+
         for row in reader:
-            key = (row.get("lumber_id", ""), row.get("surface_id", ""))
-            counts[key] = counts.get(key, 0) + 1
-    return counts
+            if row.get("lumber_id") == lumber_id and row.get("surface_id") == surface_id:
+                count += 1
+
+    return count
 
 
-def read_existing_surface_info(surface_info_path: Path) -> dict[str, SurfaceInfo]:
-    infos: dict[str, SurfaceInfo] = {}
-    if not surface_info_path.exists():
-        return infos
-
-    with surface_info_path.open("r", newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            image_file = row.get("image_file", "")
-            if not image_file:
-                continue
-            infos[image_file] = SurfaceInfo(
-                lumber_id=row.get("lumber_id", ""),
-                surface_id=row.get("surface_id", ""),
-                image_file=image_file,
-                surface_width_mm=row.get("surface_width_mm", ""),
-                lumber_length_mm=row.get("lumber_length_mm", ""),
-                length_px=int(float(row.get("length_px", 0) or 0)),
-                width_px=int(float(row.get("width_px", 0) or 0)),
-            )
-    return infos
+def round_float(value: float, ndigits: int = 3) -> float:
+    return round(float(value), ndigits)
 
 
-def prompt_surface_info(
-    image_path: Path,
-    image: np.ndarray,
-    project_root: Path,
-    default_lumber_id: Optional[str],
-    no_prompt: bool,
-) -> SurfaceInfo:
-    h, w = image.shape[:2]
-    image_file = relpath_string(image_path, project_root)
-    default_surface_id = image_path.stem
-    lumber_id = default_lumber_id or "L001"
-    surface_id = default_surface_id
-    surface_width_mm = ""
-    lumber_length_mm = ""
+# =============================================================================
+# Geometry
+# =============================================================================
 
-    if not no_prompt:
-        print("\nSurface metadata")
-        print(f"  image_file: {image_file}")
-        value = input(f"  lumber_id [{lumber_id}]: ").strip()
-        if value:
-            lumber_id = value
-        value = input(f"  surface_id [{surface_id}]: ").strip()
-        if value:
-            surface_id = value
-        surface_width_mm = parse_optional_float(input("  surface_width_mm [blank OK]: "))
-        lumber_length_mm = parse_optional_float(input("  lumber_length_mm [blank OK]: "))
-
-    return SurfaceInfo(
-        lumber_id=lumber_id,
-        surface_id=surface_id,
-        image_file=image_file,
-        surface_width_mm=surface_width_mm,
-        lumber_length_mm=lumber_length_mm,
-        length_px=w,
-        width_px=h,
-    )
+Point = tuple[float, float]
 
 
-def polygon_bbox(points: list[tuple[float, float]]) -> dict[str, float]:
-    xs = [p[0] for p in points]
-    ys = [p[1] for p in points]
-    return {
-        "length_min_pos": float(min(xs)),
-        "length_max_pos": float(max(xs)),
-        "width_min_pos": float(min(ys)),
-        "width_max_pos": float(max(ys)),
-    }
+def distance(p1: Point, p2: Point) -> float:
+    return math.hypot(p2[0] - p1[0], p2[1] - p1[1])
 
 
-def sample_polyline(points: list[tuple[float, float]], closed: bool, step_px: float = 4.0) -> np.ndarray:
+def densify_polyline(points: list[Point], closed: bool = True, step: float = 2.0) -> list[Point]:
+    """Add points along polygon edges for more stable ellipse fitting."""
     if len(points) < 2:
-        return np.array(points, dtype=np.float32)
+        return points[:]
 
-    dense: list[tuple[float, float]] = []
+    result: list[Point] = []
     n = len(points)
+
     edge_count = n if closed else n - 1
+
     for i in range(edge_count):
-        p1 = np.array(points[i], dtype=np.float32)
-        p2 = np.array(points[(i + 1) % n], dtype=np.float32)
-        dist = float(np.linalg.norm(p2 - p1))
-        steps = max(1, int(dist / step_px))
-        for j in range(steps):
-            t = j / steps
-            p = p1 * (1.0 - t) + p2 * t
-            dense.append((float(p[0]), float(p[1])))
-    return np.array(dense, dtype=np.float32)
+        p1 = points[i]
+        p2 = points[(i + 1) % n]
+
+        dx = p2[0] - p1[0]
+        dy = p2[1] - p1[1]
+        length = math.hypot(dx, dy)
+
+        segments = max(1, int(length / step))
+
+        for j in range(segments):
+            t = j / segments
+            result.append((p1[0] + dx * t, p1[1] + dy * t))
+
+    return result
 
 
-def ellipse_from_cv2_fit(points: np.ndarray, method: str) -> EllipseResult:
-    pts = points.reshape(-1, 1, 2).astype(np.float32)
-    (cx, cy), (axis_a, axis_b), angle_deg = cv2.fitEllipse(pts)
-
-    theta = np.deg2rad(angle_deg)
-    vec_a = np.array([np.cos(theta), np.sin(theta)], dtype=np.float64)
-    vec_b = np.array([-np.sin(theta), np.cos(theta)], dtype=np.float64)
-
-    if axis_a >= axis_b:
-        long_len = float(axis_a)
-        short_len = float(axis_b)
-        long_vec = vec_a
-        short_vec = vec_b
-        long_angle = float(angle_deg)
-    else:
-        long_len = float(axis_b)
-        short_len = float(axis_a)
-        long_vec = vec_b
-        short_vec = vec_a
-        long_angle = float((angle_deg + 90.0) % 180.0)
-
-    center = np.array([cx, cy], dtype=np.float64)
-    long_delta = long_vec * long_len
-    short_delta = short_vec * short_len
-
-    long_p1 = center - long_delta / 2.0
-    long_p2 = center + long_delta / 2.0
-    short_p1 = center - short_delta / 2.0
-    short_p2 = center + short_delta / 2.0
-
-    return EllipseResult(
-        method=method,
-        center=(float(cx), float(cy)),
-        long_axis_endpoints=((float(long_p1[0]), float(long_p1[1])), (float(long_p2[0]), float(long_p2[1]))),
-        short_axis_endpoints=((float(short_p1[0]), float(short_p1[1])), (float(short_p2[0]), float(short_p2[1]))),
-        long_diam_length=abs(float(long_delta[0])),
-        long_diam_width=abs(float(long_delta[1])),
-        short_diam_length=abs(float(short_delta[0])),
-        short_diam_width=abs(float(short_delta[1])),
-        angle_deg=long_angle,
-        long_diam_px=long_len,
-        short_diam_px=short_len,
-    )
-
-
-def ellipse_from_min_area_rect(points: np.ndarray, method: str) -> EllipseResult:
-    rect = cv2.minAreaRect(points.astype(np.float32))
-    (cx, cy), (w, h), angle_deg = rect
-
-    theta = np.deg2rad(angle_deg)
-    vec_w = np.array([np.cos(theta), np.sin(theta)], dtype=np.float64)
-    vec_h = np.array([-np.sin(theta), np.cos(theta)], dtype=np.float64)
-
-    if w >= h:
-        long_len = float(w)
-        short_len = float(h)
-        long_vec = vec_w
-        short_vec = vec_h
-        long_angle = float(angle_deg)
-    else:
-        long_len = float(h)
-        short_len = float(w)
-        long_vec = vec_h
-        short_vec = vec_w
-        long_angle = float((angle_deg + 90.0) % 180.0)
-
-    center = np.array([cx, cy], dtype=np.float64)
-    long_delta = long_vec * long_len
-    short_delta = short_vec * short_len
-
-    long_p1 = center - long_delta / 2.0
-    long_p2 = center + long_delta / 2.0
-    short_p1 = center - short_delta / 2.0
-    short_p2 = center + short_delta / 2.0
-
-    return EllipseResult(
-        method=method,
-        center=(float(cx), float(cy)),
-        long_axis_endpoints=((float(long_p1[0]), float(long_p1[1])), (float(long_p2[0]), float(long_p2[1]))),
-        short_axis_endpoints=((float(short_p1[0]), float(short_p1[1])), (float(short_p2[0]), float(short_p2[1]))),
-        long_diam_length=abs(float(long_delta[0])),
-        long_diam_width=abs(float(long_delta[1])),
-        short_diam_length=abs(float(short_delta[0])),
-        short_diam_width=abs(float(short_delta[1])),
-        angle_deg=long_angle,
-        long_diam_px=long_len,
-        short_diam_px=short_len,
-    )
-
-
-def fit_ellipse_from_points(
-    points: list[tuple[float, float]],
-    *,
+def ellipse_from_cv2_rect(
+    rect: tuple[tuple[float, float], tuple[float, float], float],
     method: str,
-    closed: bool,
-) -> EllipseResult:
-    if len(points) < 3:
-        raise ValueError("At least 3 points are required.")
+) -> dict[str, object]:
+    """Convert OpenCV ellipse/minAreaRect output to measurement values."""
+    (cx, cy), (axis_w, axis_h), angle_deg = rect
 
-    if method == "fit_ellipse":
-        fit_points = sample_polyline(points, closed=closed, step_px=4.0)
+    theta_w = math.radians(angle_deg)
+    theta_h = theta_w + math.pi / 2.0
+
+    if axis_w >= axis_h:
+        long_len = axis_w
+        short_len = axis_h
+        long_theta = theta_w
+        short_theta = theta_h
     else:
-        fit_points = np.array(points, dtype=np.float32)
+        long_len = axis_h
+        short_len = axis_w
+        long_theta = theta_h
+        short_theta = theta_w
 
-    if len(fit_points) >= 5:
-        return ellipse_from_cv2_fit(fit_points, method=method)
+    long_dx = long_len * math.cos(long_theta)
+    long_dy = long_len * math.sin(long_theta)
+    short_dx = short_len * math.cos(short_theta)
+    short_dy = short_len * math.sin(short_theta)
 
-    return ellipse_from_min_area_rect(fit_points, method=f"{method}_min_area_rect_fallback")
+    long_p1 = (cx - long_dx / 2.0, cy - long_dy / 2.0)
+    long_p2 = (cx + long_dx / 2.0, cy + long_dy / 2.0)
 
+    short_p1 = (cx - short_dx / 2.0, cy - short_dy / 2.0)
+    short_p2 = (cx + short_dx / 2.0, cy + short_dy / 2.0)
 
-def point_to_list(point: tuple[float, float]) -> list[float]:
-    return [float(point[0]), float(point[1])]
-
-
-def ellipse_to_dict(ellipse: EllipseResult) -> dict[str, object]:
     return {
-        "method": ellipse.method,
-        "center": point_to_list(ellipse.center),
+        "method": method,
+        "center": [round_float(cx), round_float(cy)],
+        "long_axis_length": round_float(long_len),
+        "short_axis_length": round_float(short_len),
         "long_axis_endpoints": [
-            point_to_list(ellipse.long_axis_endpoints[0]),
-            point_to_list(ellipse.long_axis_endpoints[1]),
+            [round_float(long_p1[0]), round_float(long_p1[1])],
+            [round_float(long_p2[0]), round_float(long_p2[1])],
         ],
         "short_axis_endpoints": [
-            point_to_list(ellipse.short_axis_endpoints[0]),
-            point_to_list(ellipse.short_axis_endpoints[1]),
+            [round_float(short_p1[0]), round_float(short_p1[1])],
+            [round_float(short_p2[0]), round_float(short_p2[1])],
         ],
-        "long_diam_length": ellipse.long_diam_length,
-        "long_diam_width": ellipse.long_diam_width,
-        "short_diam_length": ellipse.short_diam_length,
-        "short_diam_width": ellipse.short_diam_width,
-        "angle_deg": ellipse.angle_deg,
-        "long_diam_px": ellipse.long_diam_px,
-        "short_diam_px": ellipse.short_diam_px,
+        "long_diam_length": round_float(long_dx),
+        "long_diam_width": round_float(long_dy),
+        "short_diam_length": round_float(short_dx),
+        "short_diam_width": round_float(short_dy),
+        "cv2_angle_deg": round_float(angle_deg),
     }
 
 
-class ManualMeasureApp:
-    def __init__(
-        self,
-        *,
-        project_root: Path,
-        image_dir: Path,
-        annotation_dir: Path,
-        surface_info_path: Path,
-        default_lumber_id: Optional[str],
-        no_prompt_surface_info: bool,
-        display_width: int,
-        display_height: int,
-    ) -> None:
-        self.project_root = project_root
-        self.image_dir = image_dir
-        self.annotation_dir = annotation_dir
-        self.surface_info_path = surface_info_path
-        self.default_lumber_id = default_lumber_id
-        self.no_prompt_surface_info = no_prompt_surface_info
-        self.display_width = display_width
-        self.display_height = display_height
+def fit_ellipse_from_points(points: list[Point], method_hint: str) -> dict[str, object]:
+    """Fit an ellipse. Fallback to minAreaRect if fitEllipse fails."""
+    if len(points) < 2:
+        raise ValueError("At least 2 points are required for axis estimation.")
 
-        self.knot_csv_path = annotation_dir / "knot_measurements.csv"
-        self.detail_jsonl_path = annotation_dir / "annotation_detail.jsonl"
-        self.preview_dir = annotation_dir / "preview"
-        self.backup_dir = annotation_dir / "backups"
+    pts = np.array(points, dtype=np.float32)
 
-        for path in [annotation_dir, self.preview_dir, self.backup_dir, surface_info_path.parent]:
-            path.mkdir(parents=True, exist_ok=True)
+    if len(points) >= 5:
+        try:
+            rect = cv2.fitEllipse(pts.reshape(-1, 1, 2))
+            return ellipse_from_cv2_rect(rect, method_hint)
+        except cv2.error:
+            pass
 
-        self.image_paths = self._find_images()
-        if not self.image_paths:
-            raise FileNotFoundError(f"No images found in {self.image_dir}")
+    rect = cv2.minAreaRect(pts.reshape(-1, 1, 2))
+    return ellipse_from_cv2_rect(rect, f"{method_hint}_min_area_rect_fallback")
 
-        ensure_csv_header(self.knot_csv_path, KNOT_CSV_COLUMNS)
-        ensure_csv_header(self.surface_info_path, SURFACE_INFO_COLUMNS)
 
-        self.surface_infos = read_existing_surface_info(self.surface_info_path)
-        self.knot_counts = read_existing_knot_counts(self.knot_csv_path)
+def bbox_from_polygon(points: list[Point]) -> dict[str, float]:
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
 
-        self.index = 0
-        self.image: Optional[np.ndarray] = None
-        self.image_path: Optional[Path] = None
-        self.surface_info: Optional[SurfaceInfo] = None
-        self.annotations_by_image: dict[str, list[AnnotationRecord]] = {}
+    return {
+        "length_min_pos": round_float(min(xs)),
+        "length_max_pos": round_float(max(xs)),
+        "width_min_pos": round_float(min(ys)),
+        "width_max_pos": round_float(max(ys)),
+    }
 
-        self.zoom = 1.0
-        self.view_x = 0.0
-        self.view_y = 0.0
 
-        self.mode = "polygon"  # polygon, review, fit
-        self.polygon_points: list[tuple[float, float]] = []
-        self.fit_points: list[tuple[float, float]] = []
-        self.current_ellipse: Optional[EllipseResult] = None
-        self.current_ellipse_fit_points: list[tuple[float, float]] = []
-        self.current_method = "fit_ellipse"
-        self.message = ""
+# =============================================================================
+# Preview drawing
+# =============================================================================
 
-        self.window_name = "manual_measure"
+def draw_preview(
+    image_bgr: np.ndarray,
+    details: list[dict[str, object]],
+) -> np.ndarray:
+    preview = image_bgr.copy()
 
-    def _find_images(self) -> list[Path]:
-        return [
-            p for p in sorted(self.image_dir.iterdir())
-            if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
-        ]
+    for detail in details:
+        knot_id = str(detail["knot_id"])
+        polygon_points = detail.get("polygon_points", [])
+        ellipse = detail.get("ellipse", {})
 
-    def run(self) -> None:
-        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(self.window_name, self.display_width, self.display_height)
-        cv2.setMouseCallback(self.window_name, self._on_mouse)
+        if polygon_points:
+            pts = np.array(polygon_points, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.polylines(preview, [pts], isClosed=True, color=(0, 0, 255), thickness=2)
 
-        self._load_image(self.index)
+        try:
+            center = ellipse["center"]
+            long_ep = ellipse["long_axis_endpoints"]
+            short_ep = ellipse["short_axis_endpoints"]
 
-        while True:
-            frame = self._render()
-            cv2.imshow(self.window_name, frame)
-            key = cv2.waitKeyEx(30)
-            if key == -1:
-                continue
-            if self._handle_key(key):
-                break
+            center_pt = (int(round(center[0])), int(round(center[1])))
 
-        cv2.destroyAllWindows()
+            long_p1 = tuple(int(round(v)) for v in long_ep[0])
+            long_p2 = tuple(int(round(v)) for v in long_ep[1])
+            short_p1 = tuple(int(round(v)) for v in short_ep[0])
+            short_p2 = tuple(int(round(v)) for v in short_ep[1])
 
-    def _load_image(self, index: int) -> None:
-        self.index = max(0, min(index, len(self.image_paths) - 1))
-        self.image_path = self.image_paths[self.index]
-        self.image = cv2.imread(str(self.image_path))
-        if self.image is None:
-            raise RuntimeError(f"Failed to read image: {self.image_path}")
-
-        image_file = relpath_string(self.image_path, self.project_root)
-        if image_file in self.surface_infos:
-            self.surface_info = self.surface_infos[image_file]
-        else:
-            self.surface_info = prompt_surface_info(
-                self.image_path,
-                self.image,
-                self.project_root,
-                self.default_lumber_id,
-                self.no_prompt_surface_info,
+            long_len = distance(long_ep[0], long_ep[1])
+            short_len = distance(short_ep[0], short_ep[1])
+            angle = math.degrees(
+                math.atan2(long_ep[1][1] - long_ep[0][1], long_ep[1][0] - long_ep[0][0])
             )
-            append_csv_row(self.surface_info_path, SURFACE_INFO_COLUMNS, asdict(self.surface_info))
-            self.surface_infos[image_file] = self.surface_info
 
-        self._reset_current()
+            if long_len > 0 and short_len > 0:
+                cv2.ellipse(
+                    preview,
+                    center_pt,
+                    (int(round(long_len / 2.0)), int(round(short_len / 2.0))),
+                    angle,
+                    0,
+                    360,
+                    color=(0, 255, 0),
+                    thickness=2,
+                )
+
+            cv2.line(preview, long_p1, long_p2, (255, 0, 0), 2)
+            cv2.line(preview, short_p1, short_p2, (0, 255, 255), 2)
+            cv2.circle(preview, center_pt, 4, (255, 255, 255), -1)
+            cv2.putText(
+                preview,
+                knot_id,
+                (center_pt[0] + 5, center_pt[1] - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 0, 255),
+                2,
+                cv2.LINE_AA,
+            )
+        except Exception:
+            continue
+
+    return preview
+
+
+# =============================================================================
+# Tkinter app
+# =============================================================================
+
+class ManualMeasureApp:
+    def __init__(self, root: tk.Tk) -> None:
+        ensure_dirs()
+
+        self.root = root
+        self.root.title("Manual Knot Measurement Tool")
+        self.root.geometry("1280x800")
+
+        self.image_path: Path | None = None
+        self.image_bgr: np.ndarray | None = None
+        self.image_rgb: np.ndarray | None = None
+        self.image_width_px: int = 0
+        self.image_height_px: int = 0
+
+        self.scale: float = 1.0
+        self.tk_image: ImageTk.PhotoImage | None = None
+
+        self.current_polygon: list[Point] = []
+        self.current_fit_points: list[Point] = []
+        self.current_polygon_closed: bool = False
+
+        self.current_knot_rows: list[dict[str, object]] = []
+        self.current_detail_records: list[dict[str, object]] = []
+        self.next_knot_index: int = 1
+
+        self.lumber_id_var = tk.StringVar()
+        self.surface_id_var = tk.StringVar()
+        self.surface_width_var = tk.StringVar()
+        self.lumber_length_var = tk.StringVar()
+        self.image_path_var = tk.StringVar()
+
+        self.selected_arc_mode_var = tk.BooleanVar(value=False)
+        self.is_truncated_var = tk.BooleanVar(value=False)
+
+        self.status_var = tk.StringVar(value="Select a surface image.")
+
+        self.selection_frame: ttk.Frame | None = None
+        self.annotation_frame: ttk.Frame | None = None
+        self.canvas: tk.Canvas | None = None
+
+        self._show_selection_frame()
+
+    # -------------------------------------------------------------------------
+    # Selection screen
+    # -------------------------------------------------------------------------
+
+    def _show_selection_frame(self) -> None:
+        self._clear_root()
+
+        frame = ttk.Frame(self.root, padding=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+        self.selection_frame = frame
+
+        ttk.Label(frame, text="Surface image selection", font=("Arial", 16, "bold")).grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=(0, 20)
+        )
+
+        ttk.Label(frame, text="Image file").grid(row=1, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=self.image_path_var, width=80).grid(
+            row=1, column=1, sticky="ew", padx=5
+        )
+        ttk.Button(frame, text="Browse...", command=self._select_image).grid(row=1, column=2)
+
+        ttk.Label(frame, text="lumber_id").grid(row=2, column=0, sticky="w", pady=(15, 0))
+        ttk.Entry(frame, textvariable=self.lumber_id_var, width=30).grid(
+            row=2, column=1, sticky="w", pady=(15, 0)
+        )
+
+        ttk.Label(frame, text="surface_id").grid(row=3, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=self.surface_id_var, width=30).grid(
+            row=3, column=1, sticky="w"
+        )
+
+        ttk.Label(frame, text="surface_width_mm").grid(row=4, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=self.surface_width_var, width=30).grid(
+            row=4, column=1, sticky="w"
+        )
+
+        ttk.Label(frame, text="lumber_length_mm").grid(row=5, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=self.lumber_length_var, width=30).grid(
+            row=5, column=1, sticky="w"
+        )
+
+        ttk.Button(
+            frame,
+            text="Start measurement",
+            command=self._start_annotation,
+        ).grid(row=6, column=1, sticky="w", pady=25)
+
+        ttk.Label(
+            frame,
+            textvariable=self.status_var,
+            foreground="blue",
+        ).grid(row=7, column=0, columnspan=3, sticky="w")
+
+        frame.columnconfigure(1, weight=1)
+
+    def _select_image(self) -> None:
+        initial_dir = IMAGE_DIR if IMAGE_DIR.exists() else PROJECT_ROOT
+
+        file_path = filedialog.askopenfilename(
+            title="Select surface image",
+            initialdir=str(initial_dir),
+            filetypes=[
+                ("Image files", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff"),
+                ("All files", "*.*"),
+            ],
+        )
+
+        if not file_path:
+            return
+
+        self.image_path = Path(file_path)
+        self.image_path_var.set(str(self.image_path))
+
+        if not self.surface_id_var.get():
+            self.surface_id_var.set(self.image_path.stem)
+
+    def _start_annotation(self) -> None:
+        try:
+            image_path = Path(self.image_path_var.get()).expanduser()
+
+            if not image_path.exists():
+                raise ValueError("Image file does not exist.")
+
+            lumber_id = self.lumber_id_var.get().strip()
+            surface_id = self.surface_id_var.get().strip()
+
+            if not lumber_id:
+                raise ValueError("lumber_id is required.")
+            if not surface_id:
+                raise ValueError("surface_id is required.")
+
+            surface_width_mm = float(self.surface_width_var.get())
+            lumber_length_mm = float(self.lumber_length_var.get())
+
+            if surface_width_mm <= 0:
+                raise ValueError("surface_width_mm must be positive.")
+            if lumber_length_mm <= 0:
+                raise ValueError("lumber_length_mm must be positive.")
+
+            self.image_path = image_path
+            self.image_bgr = read_image_bgr(image_path)
+            self.image_rgb = cv2.cvtColor(self.image_bgr, cv2.COLOR_BGR2RGB)
+
+            self.image_height_px, self.image_width_px = self.image_bgr.shape[:2]
+
+            self.current_polygon = []
+            self.current_fit_points = []
+            self.current_polygon_closed = False
+            self.current_knot_rows = []
+            self.current_detail_records = []
+            self.next_knot_index = count_existing_knots(lumber_id, surface_id) + 1
+
+            self._show_annotation_frame()
+
+        except Exception as error:
+            messagebox.showerror("Error", str(error))
+
+    # -------------------------------------------------------------------------
+    # Annotation screen
+    # -------------------------------------------------------------------------
+
+    def _show_annotation_frame(self) -> None:
+        self._clear_root()
+
+        frame = ttk.Frame(self.root)
+        frame.pack(fill=tk.BOTH, expand=True)
+        self.annotation_frame = frame
+
+        control = ttk.Frame(frame, padding=8)
+        control.pack(side=tk.LEFT, fill=tk.Y)
+
+        ttk.Label(
+            control,
+            text="Manual Measurement",
+            font=("Arial", 13, "bold"),
+        ).pack(anchor="w", pady=(0, 10))
+
+        ttk.Label(control, text=f"lumber_id: {self.lumber_id_var.get()}").pack(anchor="w")
+        ttk.Label(control, text=f"surface_id: {self.surface_id_var.get()}").pack(anchor="w")
+        ttk.Label(control, text=f"image: {Path(self.image_path_var.get()).name}").pack(anchor="w")
+        ttk.Label(control, text=f"size(px): {self.image_width_px} x {self.image_height_px}").pack(
+            anchor="w", pady=(0, 10)
+        )
+
+        ttk.Checkbutton(
+            control,
+            text="Use selected ellipse arc points",
+            variable=self.selected_arc_mode_var,
+        ).pack(anchor="w", pady=(8, 2))
+
+        ttk.Checkbutton(
+            control,
+            text="Truncated / cut knot",
+            variable=self.is_truncated_var,
+        ).pack(anchor="w", pady=(0, 8))
+
+        ttk.Button(control, text="Save current knot", command=self._save_current_knot).pack(
+            fill=tk.X, pady=2
+        )
+        ttk.Button(control, text="Undo point", command=self._undo_point).pack(fill=tk.X, pady=2)
+        ttk.Button(control, text="Cancel current knot", command=self._cancel_current_knot).pack(
+            fill=tk.X, pady=2
+        )
+        ttk.Button(control, text="Undo last saved knot", command=self._undo_last_saved_knot).pack(
+            fill=tk.X, pady=2
+        )
+
+        ttk.Separator(control).pack(fill=tk.X, pady=10)
+
+        ttk.Button(control, text="Zoom in", command=lambda: self._change_zoom(1.25)).pack(
+            fill=tk.X, pady=2
+        )
+        ttk.Button(control, text="Zoom out", command=lambda: self._change_zoom(0.8)).pack(
+            fill=tk.X, pady=2
+        )
+        ttk.Button(control, text="Fit to window", command=self._fit_to_window).pack(
+            fill=tk.X, pady=2
+        )
+
+        ttk.Separator(control).pack(fill=tk.X, pady=10)
+
+        ttk.Button(control, text="Finish this surface", command=self._finish_surface).pack(
+            fill=tk.X, pady=2
+        )
+        ttk.Button(control, text="Back without saving", command=self._back_without_saving).pack(
+            fill=tk.X, pady=2
+        )
+
+        ttk.Label(
+            control,
+            textvariable=self.status_var,
+            foreground="blue",
+            wraplength=260,
+        ).pack(anchor="w", pady=(15, 0))
+
+        canvas_frame = ttk.Frame(frame)
+        canvas_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+        self.canvas = tk.Canvas(canvas_frame, background="black")
+        hbar = ttk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL, command=self.canvas.xview)
+        vbar = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=self.canvas.yview)
+
+        self.canvas.configure(xscrollcommand=hbar.set, yscrollcommand=vbar.set)
+
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        vbar.grid(row=0, column=1, sticky="ns")
+        hbar.grid(row=1, column=0, sticky="ew")
+
+        canvas_frame.rowconfigure(0, weight=1)
+        canvas_frame.columnconfigure(0, weight=1)
+
+        self.canvas.bind("<Button-1>", self._on_left_click)
+
+        self.root.update_idletasks()
         self._fit_to_window()
-        self.message = f"Loaded {self.image_path.name} ({self.index + 1}/{len(self.image_paths)})"
-
-    def _reset_current(self) -> None:
-        self.mode = "polygon"
-        self.polygon_points = []
-        self.fit_points = []
-        self.current_ellipse = None
-        self.current_ellipse_fit_points = []
-        self.current_method = "fit_ellipse"
+        self.status_var.set(
+            "Click polygon points. Click the first point again to close the knot."
+        )
 
     def _fit_to_window(self) -> None:
-        assert self.image is not None
-        h, w = self.image.shape[:2]
-        self.zoom = min(self.display_width / w, self.display_height / h)
-        self.zoom = min(self.zoom, 1.0)
-        if self.zoom <= 0:
-            self.zoom = 1.0
-        self.view_x = 0.0
-        self.view_y = 0.0
+        if self.image_rgb is None:
+            return
 
-    def _clamp_view(self) -> None:
-        assert self.image is not None
-        h, w = self.image.shape[:2]
-        viewport_w = self.display_width / self.zoom
-        viewport_h = self.display_height / self.zoom
-        self.view_x = max(0.0, min(self.view_x, max(0.0, w - viewport_w)))
-        self.view_y = max(0.0, min(self.view_y, max(0.0, h - viewport_h)))
+        screen_w = max(self.root.winfo_width() - 330, 400)
+        screen_h = max(self.root.winfo_height() - 80, 300)
 
-    def _screen_to_image(self, x: int, y: int) -> tuple[float, float]:
-        return self.view_x + x / self.zoom, self.view_y + y / self.zoom
+        scale_w = screen_w / self.image_width_px
+        scale_h = screen_h / self.image_height_px
 
-    def _image_to_screen(self, point: tuple[float, float]) -> tuple[int, int]:
-        x = int(round((point[0] - self.view_x) * self.zoom))
-        y = int(round((point[1] - self.view_y) * self.zoom))
+        self.scale = min(1.0, max(0.05, min(scale_w, scale_h)))
+        self._render_image()
+
+    def _change_zoom(self, factor: float) -> None:
+        self.scale = max(0.03, min(5.0, self.scale * factor))
+        self._render_image()
+
+    def _render_image(self) -> None:
+        if self.canvas is None or self.image_rgb is None:
+            return
+
+        display_w = max(1, int(self.image_width_px * self.scale))
+        display_h = max(1, int(self.image_height_px * self.scale))
+
+        image = Image.fromarray(self.image_rgb)
+
+        try:
+            resample = Image.Resampling.LANCZOS
+        except AttributeError:
+            resample = Image.LANCZOS
+
+        image = image.resize((display_w, display_h), resample)
+        self.tk_image = ImageTk.PhotoImage(image)
+
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, anchor=tk.NW, image=self.tk_image, tags=("image",))
+        self.canvas.configure(scrollregion=(0, 0, display_w, display_h))
+
+        self._redraw_overlay()
+
+    def _image_to_canvas(self, point: Point) -> Point:
+        return point[0] * self.scale, point[1] * self.scale
+
+    def _canvas_to_image(self, event: tk.Event) -> Point:
+        if self.canvas is None:
+            return 0.0, 0.0
+
+        x = self.canvas.canvasx(event.x) / self.scale
+        y = self.canvas.canvasy(event.y) / self.scale
+
+        x = max(0.0, min(float(self.image_width_px - 1), x))
+        y = max(0.0, min(float(self.image_height_px - 1), y))
+
         return x, y
 
-    def _point_inside_image(self, point: tuple[float, float]) -> bool:
-        assert self.image is not None
-        h, w = self.image.shape[:2]
-        return 0 <= point[0] < w and 0 <= point[1] < h
-
-    def _on_mouse(self, event: int, x: int, y: int, flags: int, param: object) -> None:
-        if event not in (cv2.EVENT_LBUTTONDOWN, cv2.EVENT_RBUTTONDOWN):
+    def _redraw_overlay(self) -> None:
+        if self.canvas is None:
             return
 
-        point = self._screen_to_image(x, y)
-        if not self._point_inside_image(point):
+        self.canvas.delete("overlay")
+
+        # Saved knots
+        for detail in self.current_detail_records:
+            self._draw_detail_overlay(detail)
+
+        # Current polygon
+        if self.current_polygon:
+            for i, point in enumerate(self.current_polygon):
+                x, y = self._image_to_canvas(point)
+                self.canvas.create_oval(
+                    x - POLYGON_POINT_RADIUS,
+                    y - POLYGON_POINT_RADIUS,
+                    x + POLYGON_POINT_RADIUS,
+                    y + POLYGON_POINT_RADIUS,
+                    fill="red",
+                    outline="white",
+                    tags=("overlay",),
+                )
+
+                if i > 0:
+                    x0, y0 = self._image_to_canvas(self.current_polygon[i - 1])
+                    self.canvas.create_line(x0, y0, x, y, fill="red", width=2, tags=("overlay",))
+
+            if self.current_polygon_closed and len(self.current_polygon) >= 3:
+                x0, y0 = self._image_to_canvas(self.current_polygon[-1])
+                x1, y1 = self._image_to_canvas(self.current_polygon[0])
+                self.canvas.create_line(x0, y0, x1, y1, fill="red", width=2, tags=("overlay",))
+
+        # Current selected ellipse-fit points
+        for point in self.current_fit_points:
+            x, y = self._image_to_canvas(point)
+            self.canvas.create_oval(
+                x - FIT_POINT_RADIUS,
+                y - FIT_POINT_RADIUS,
+                x + FIT_POINT_RADIUS,
+                y + FIT_POINT_RADIUS,
+                fill="cyan",
+                outline="black",
+                tags=("overlay",),
+            )
+
+    def _draw_detail_overlay(self, detail: dict[str, object]) -> None:
+        if self.canvas is None:
             return
 
-        if event == cv2.EVENT_RBUTTONDOWN:
-            self._undo_point()
+        polygon = detail.get("polygon_points", [])
+        knot_id = str(detail.get("knot_id", ""))
+
+        if polygon:
+            canvas_points: list[float] = []
+
+            for p in polygon:
+                x, y = self._image_to_canvas((float(p[0]), float(p[1])))
+                canvas_points.extend([x, y])
+
+            self.canvas.create_polygon(
+                canvas_points,
+                outline="orange",
+                fill="",
+                width=2,
+                tags=("overlay",),
+            )
+
+        ellipse = detail.get("ellipse", {})
+
+        try:
+            center = ellipse["center"]
+            long_ep = ellipse["long_axis_endpoints"]
+            short_ep = ellipse["short_axis_endpoints"]
+
+            cx, cy = self._image_to_canvas((float(center[0]), float(center[1])))
+            long_p1 = self._image_to_canvas((float(long_ep[0][0]), float(long_ep[0][1])))
+            long_p2 = self._image_to_canvas((float(long_ep[1][0]), float(long_ep[1][1])))
+            short_p1 = self._image_to_canvas((float(short_ep[0][0]), float(short_ep[0][1])))
+            short_p2 = self._image_to_canvas((float(short_ep[1][0]), float(short_ep[1][1])))
+
+            self.canvas.create_line(*long_p1, *long_p2, fill="blue", width=2, tags=("overlay",))
+            self.canvas.create_line(*short_p1, *short_p2, fill="yellow", width=2, tags=("overlay",))
+            self.canvas.create_oval(cx - 3, cy - 3, cx + 3, cy + 3, fill="white", tags=("overlay",))
+            self.canvas.create_text(
+                cx + 12,
+                cy - 12,
+                text=knot_id,
+                fill="white",
+                anchor=tk.W,
+                tags=("overlay",),
+            )
+        except Exception:
             return
 
-        if self.mode == "polygon":
-            self._add_polygon_point(point)
-        elif self.mode == "fit":
-            self.fit_points.append(point)
-            self.message = f"Fit points: {len(self.fit_points)}"
-        elif self.mode == "review":
-            self.message = "Review mode. Press s/Enter to save, f to refit, r to reset."
+    def _on_left_click(self, event: tk.Event) -> None:
+        point = self._canvas_to_image(event)
 
-    def _add_polygon_point(self, point: tuple[float, float]) -> None:
-        if len(self.polygon_points) >= 3:
-            first = self.polygon_points[0]
-            screen_first = np.array(self._image_to_screen(first), dtype=np.float64)
-            screen_point = np.array(self._image_to_screen(point), dtype=np.float64)
-            if float(np.linalg.norm(screen_first - screen_point)) <= 12.0:
-                self._close_polygon_and_fit()
+        if self.current_polygon_closed:
+            if self.selected_arc_mode_var.get():
+                self.current_fit_points.append(point)
+                self.status_var.set(
+                    f"Ellipse arc points: {len(self.current_fit_points)}. "
+                    "Click Save current knot when finished."
+                )
+                self._redraw_overlay()
+            return
+
+        if len(self.current_polygon) >= 3:
+            first_point = self.current_polygon[0]
+            threshold = CLOSE_POINT_RADIUS_SCREEN_PX / self.scale
+
+            if distance(point, first_point) <= threshold:
+                self.current_polygon_closed = True
+
+                if self.selected_arc_mode_var.get():
+                    self.status_var.set(
+                        "Polygon closed. Select at least 5 ellipse arc points, "
+                        "then click Save current knot."
+                    )
+                    self._redraw_overlay()
+                else:
+                    self._save_current_knot()
+
                 return
 
-        self.polygon_points.append(point)
-        self.message = f"Polygon points: {len(self.polygon_points)}"
+        self.current_polygon.append(point)
+        self._redraw_overlay()
 
-    def _close_polygon_and_fit(self) -> None:
-        if len(self.polygon_points) < 3:
-            self.message = "Need at least 3 polygon points."
-            return
+    # -------------------------------------------------------------------------
+    # Knot operations
+    # -------------------------------------------------------------------------
+
+    def _save_current_knot(self) -> None:
         try:
-            ellipse = fit_ellipse_from_points(
-                self.polygon_points,
-                method="fit_ellipse",
-                closed=True,
-            )
+            if not self.current_polygon_closed:
+                if len(self.current_polygon) < 3:
+                    raise ValueError("At least 3 polygon points are required.")
+                self.current_polygon_closed = True
+
+            if len(self.current_polygon) < 3:
+                raise ValueError("At least 3 polygon points are required.")
+
+            if self.selected_arc_mode_var.get():
+                if len(self.current_fit_points) < 5:
+                    raise ValueError(
+                        "At least 5 ellipse arc points are required in selected-arc mode."
+                    )
+                fit_points = self.current_fit_points[:]
+                fit_method = "selected_arc_fit"
+                stored_fit_points = self.current_fit_points[:]
+            else:
+                fit_points = densify_polyline(
+                    self.current_polygon,
+                    closed=True,
+                    step=AUTO_DENSIFY_STEP_PX,
+                )
+                fit_method = "fit_ellipse"
+                stored_fit_points = self.current_polygon[:]
+
+            ellipse = fit_ellipse_from_points(fit_points, fit_method)
+            bbox = bbox_from_polygon(self.current_polygon)
+
+            lumber_id = self.lumber_id_var.get().strip()
+            surface_id = self.surface_id_var.get().strip()
+            image_file = path_to_storable_string(Path(self.image_path_var.get()))
+
+            knot_id = f"K{self.next_knot_index:03d}"
+            self.next_knot_index += 1
+
+            created_at = now_string()
+
+            row = {
+                "lumber_id": lumber_id,
+                "surface_id": surface_id,
+                "knot_id": knot_id,
+                "image_file": image_file,
+                "length_min_pos": bbox["length_min_pos"],
+                "length_max_pos": bbox["length_max_pos"],
+                "width_min_pos": bbox["width_min_pos"],
+                "width_max_pos": bbox["width_max_pos"],
+                "center_point_length": ellipse["center"][0],
+                "center_point_width": ellipse["center"][1],
+                "long_diam_length": ellipse["long_diam_length"],
+                "long_diam_width": ellipse["long_diam_width"],
+                "short_diam_length": ellipse["short_diam_length"],
+                "short_diam_width": ellipse["short_diam_width"],
+                "ellipse_method": ellipse["method"],
+                "is_truncated": str(bool(self.is_truncated_var.get())),
+                "created_at": created_at,
+            }
+
+            detail = {
+                "lumber_id": lumber_id,
+                "surface_id": surface_id,
+                "knot_id": knot_id,
+                "image_file": image_file,
+                "polygon_points": [
+                    [round_float(x), round_float(y)]
+                    for x, y in self.current_polygon
+                ],
+                "ellipse_fit_points": [
+                    [round_float(x), round_float(y)]
+                    for x, y in stored_fit_points
+                ],
+                "ellipse_method": ellipse["method"],
+                "bbox": bbox,
+                "ellipse": ellipse,
+                "is_truncated": bool(self.is_truncated_var.get()),
+                "created_at": created_at,
+                "comment": "",
+            }
+
+            self.current_knot_rows.append(row)
+            self.current_detail_records.append(detail)
+
+            self._cancel_current_knot(reset_truncated=True)
+
+            self.status_var.set(f"Saved {knot_id}. Continue clicking next knot.")
+
         except Exception as error:
-            self.message = f"Ellipse fitting failed: {error}"
-            return
-
-        self.current_ellipse = ellipse
-        self.current_ellipse_fit_points = list(self.polygon_points)
-        self.current_method = ellipse.method
-        self.mode = "review"
-        self.message = "Polygon closed. Press s/Enter to save, f to select arc points, a to auto-fit again."
-
-    def _fit_selected_points(self) -> None:
-        if len(self.fit_points) < 3:
-            self.message = "Need at least 3 fit points."
-            return
-        try:
-            ellipse = fit_ellipse_from_points(
-                self.fit_points,
-                method="selected_arc_fit",
-                closed=False,
-            )
-        except Exception as error:
-            self.message = f"Selected-arc fit failed: {error}"
-            return
-
-        self.current_ellipse = ellipse
-        self.current_ellipse_fit_points = list(self.fit_points)
-        self.current_method = ellipse.method
-        self.mode = "review"
-        self.message = "Selected-arc ellipse fitted. Press s/Enter to save."
+            messagebox.showerror("Save current knot failed", str(error))
 
     def _undo_point(self) -> None:
-        if self.mode == "polygon" and self.polygon_points:
-            self.polygon_points.pop()
-            self.message = f"Polygon points: {len(self.polygon_points)}"
-        elif self.mode == "fit" and self.fit_points:
-            self.fit_points.pop()
-            self.message = f"Fit points: {len(self.fit_points)}"
-        else:
-            self.message = "Nothing to undo."
+        if self.current_polygon_closed and self.current_fit_points:
+            self.current_fit_points.pop()
+        elif self.current_polygon:
+            self.current_polygon.pop()
+            self.current_polygon_closed = False
 
-    def _handle_key(self, key: int) -> bool:
-        # Normalize common ASCII keys.
-        char = chr(key & 0xFF) if 0 <= (key & 0xFF) < 256 else ""
+        self._redraw_overlay()
 
-        if key in (27,) or char == "q":
-            return True
+    def _cancel_current_knot(self, reset_truncated: bool = False) -> None:
+        self.current_polygon = []
+        self.current_fit_points = []
+        self.current_polygon_closed = False
 
-        if char in ("+", "="):
-            self._zoom(1.25)
-        elif char in ("-", "_"):
-            self._zoom(1 / 1.25)
-        elif char == "0":
-            self._fit_to_window()
-        elif char == "h":
-            self._pan(-0.20, 0.0)
-        elif char == "l":
-            self._pan(0.20, 0.0)
-        elif char == "k":
-            self._pan(0.0, -0.20)
-        elif char == "j":
-            self._pan(0.0, 0.20)
-        elif char == "u":
-            self._undo_point()
-        elif char == "r":
-            self._reset_current()
-            self.message = "Current knot reset."
-        elif char == "n":
-            self._next_image()
-        elif char == "p":
-            self._previous_image()
-        elif char == "f":
-            if self.mode == "review":
-                self.mode = "fit"
-                self.fit_points = []
-                self.message = "Fit mode: click ellipse-arc points, then press Enter."
-        elif char == "a":
-            if self.mode == "review":
-                self._close_polygon_and_fit()
-        elif char == "s":
-            if self.mode == "review":
-                self._save_current_annotation()
-        elif key in (10, 13):
-            if self.mode == "polygon":
-                self._close_polygon_and_fit()
-            elif self.mode == "fit":
-                self._fit_selected_points()
-            elif self.mode == "review":
-                self._save_current_annotation()
-        else:
-            self.message = "Keys: q quit, n/p image, h/j/k/l pan, +/- zoom, r reset, s save, f refit."
+        if reset_truncated:
+            self.is_truncated_var.set(False)
 
-        return False
+        self._redraw_overlay()
 
-    def _zoom(self, factor: float) -> None:
-        assert self.image is not None
-        old_zoom = self.zoom
-        center_x = self.view_x + self.display_width / (2 * old_zoom)
-        center_y = self.view_y + self.display_height / (2 * old_zoom)
-        self.zoom = max(0.02, min(self.zoom * factor, 20.0))
-        self.view_x = center_x - self.display_width / (2 * self.zoom)
-        self.view_y = center_y - self.display_height / (2 * self.zoom)
-        self._clamp_view()
-        self.message = f"zoom: {self.zoom:.3f}"
-
-    def _pan(self, dx_viewport_fraction: float, dy_viewport_fraction: float) -> None:
-        self.view_x += dx_viewport_fraction * self.display_width / self.zoom
-        self.view_y += dy_viewport_fraction * self.display_height / self.zoom
-        self._clamp_view()
-
-    def _next_image(self) -> None:
-        if self.mode != "polygon" or self.polygon_points:
-            self.message = "Unsaved/current knot exists. Press r to reset before changing image."
+    def _undo_last_saved_knot(self) -> None:
+        if not self.current_knot_rows:
+            messagebox.showinfo("Undo", "No saved knot in this surface session.")
             return
-        if self.index + 1 >= len(self.image_paths):
-            self.message = "Already at last image."
-            return
-        self._load_image(self.index + 1)
 
-    def _previous_image(self) -> None:
-        if self.mode != "polygon" or self.polygon_points:
-            self.message = "Unsaved/current knot exists. Press r to reset before changing image."
-            return
-        if self.index <= 0:
-            self.message = "Already at first image."
-            return
-        self._load_image(self.index - 1)
+        removed = self.current_knot_rows.pop()
+        self.current_detail_records.pop()
+        self.next_knot_index = max(1, self.next_knot_index - 1)
 
-    def _generate_knot_id(self) -> str:
-        assert self.surface_info is not None
-        key = (self.surface_info.lumber_id, self.surface_info.surface_id)
-        current = self.knot_counts.get(key, 0) + 1
-        self.knot_counts[key] = current
-        return f"{self.surface_info.surface_id}_K{current:03d}"
+        self.status_var.set(f"Removed {removed.get('knot_id')}.")
+        self._redraw_overlay()
 
-    def _save_current_annotation(self) -> None:
-        if self.current_ellipse is None:
-            self.message = "No ellipse to save."
-            return
-        if len(self.polygon_points) < 3:
-            self.message = "No closed polygon to save."
-            return
-        assert self.image_path is not None
-        assert self.surface_info is not None
+    # -------------------------------------------------------------------------
+    # Surface operations
+    # -------------------------------------------------------------------------
 
-        knot_id = self._generate_knot_id()
-        image_file = relpath_string(self.image_path, self.project_root)
-        bbox = polygon_bbox(self.polygon_points)
-        ellipse = self.current_ellipse
+    def _finish_surface(self) -> None:
+        try:
+            if self.current_polygon:
+                proceed = messagebox.askyesno(
+                    "Unsaved current knot",
+                    "There is an unfinished knot. Finish surface without saving it?",
+                )
+                if not proceed:
+                    return
 
-        csv_row = {
-            "lumber_id": self.surface_info.lumber_id,
-            "surface_id": self.surface_info.surface_id,
-            "knot_id": knot_id,
-            "image_file": image_file,
-            "length_min_pos": bbox["length_min_pos"],
-            "length_max_pos": bbox["length_max_pos"],
-            "width_min_pos": bbox["width_min_pos"],
-            "width_max_pos": bbox["width_max_pos"],
-            "center_point_length": ellipse.center[0],
-            "center_point_width": ellipse.center[1],
-            "long_diam_length": ellipse.long_diam_length,
-            "long_diam_width": ellipse.long_diam_width,
-            "short_diam_length": ellipse.short_diam_length,
-            "short_diam_width": ellipse.short_diam_width,
-            "ellipse_method": ellipse.method,
-        }
-        append_csv_row(self.knot_csv_path, KNOT_CSV_COLUMNS, csv_row)
+            lumber_id = self.lumber_id_var.get().strip()
+            surface_id = self.surface_id_var.get().strip()
+            image_file = path_to_storable_string(Path(self.image_path_var.get()))
+            surface_width_mm = float(self.surface_width_var.get())
+            lumber_length_mm = float(self.lumber_length_var.get())
 
-        record = AnnotationRecord(
-            lumber_id=self.surface_info.lumber_id,
-            surface_id=self.surface_info.surface_id,
-            knot_id=knot_id,
-            image_file=image_file,
-            polygon_points=[point_to_list(p) for p in self.polygon_points],
-            ellipse_fit_points=[point_to_list(p) for p in self.current_ellipse_fit_points],
-            ellipse_method=ellipse.method,
-            bbox=bbox,
-            ellipse=ellipse_to_dict(ellipse),
-            created_at=datetime.now().isoformat(timespec="seconds"),
-        )
-        append_jsonl(self.detail_jsonl_path, asdict(record))
+            created_at = now_string()
 
-        self.annotations_by_image.setdefault(image_file, []).append(record)
-        self._save_preview()
-        self._reset_current()
-        self.message = f"Saved {knot_id}"
+            surface_row = {
+                "lumber_id": lumber_id,
+                "surface_id": surface_id,
+                "image_file": image_file,
+                "surface_width_mm": surface_width_mm,
+                "lumber_length_mm": lumber_length_mm,
+                "length_px": self.image_width_px,
+                "width_px": self.image_height_px,
+                "created_at": created_at,
+            }
 
-    def _save_preview(self) -> None:
-        assert self.image is not None
-        assert self.image_path is not None
-        image_file = relpath_string(self.image_path, self.project_root)
-        canvas = self.image.copy()
-        for record in self.annotations_by_image.get(image_file, []):
-            self._draw_record_on_image(canvas, record)
-        out_path = self.preview_dir / f"{self.image_path.stem}_annotated.png"
-        cv2.imwrite(str(out_path), canvas)
+            upsert_surface_info(surface_row)
+            append_csv_rows(
+                KNOT_MEASUREMENTS_PATH,
+                KNOT_MEASUREMENT_COLUMNS,
+                self.current_knot_rows,
+            )
+            append_jsonl(ANNOTATION_DETAIL_PATH, self.current_detail_records)
 
-    def _draw_record_on_image(self, image: np.ndarray, record: AnnotationRecord) -> None:
-        polygon = np.array(record.polygon_points, dtype=np.int32)
-        if len(polygon) >= 2:
-            cv2.polylines(image, [polygon], True, (0, 0, 255), 2)
-        ellipse = record.ellipse
-        self._draw_ellipse_dict(image, ellipse, scale=1.0, offset=(0.0, 0.0))
-        if polygon.size > 0:
-            p = tuple(polygon[0])
-            cv2.putText(image, record.knot_id, (int(p[0]), int(p[1]) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
+            if self.image_bgr is not None:
+                preview = draw_preview(self.image_bgr, self.current_detail_records)
+                preview_path = PREVIEW_DIR / f"{lumber_id}_{surface_id}_annotated.png"
+                write_image(preview_path, preview)
 
-    def _render(self) -> np.ndarray:
-        assert self.image is not None
-        h, w = self.image.shape[:2]
-        self._clamp_view()
-        x0 = int(max(0, np.floor(self.view_x)))
-        y0 = int(max(0, np.floor(self.view_y)))
-        x1 = int(min(w, np.ceil(self.view_x + self.display_width / self.zoom)))
-        y1 = int(min(h, np.ceil(self.view_y + self.display_height / self.zoom)))
-        crop = self.image[y0:y1, x0:x1]
-        if crop.size == 0:
-            canvas = np.zeros((self.display_height, self.display_width, 3), dtype=np.uint8)
-        else:
-            resized = cv2.resize(crop, None, fx=self.zoom, fy=self.zoom, interpolation=cv2.INTER_AREA)
-            canvas = np.zeros((self.display_height, self.display_width, 3), dtype=np.uint8)
-            rh, rw = resized.shape[:2]
-            canvas[: min(rh, self.display_height), : min(rw, self.display_width)] = resized[: self.display_height, : self.display_width]
-
-        self._draw_overlay(canvas)
-        return canvas
-
-    def _draw_overlay(self, canvas: np.ndarray) -> None:
-        assert self.image_path is not None
-        image_file = relpath_string(self.image_path, self.project_root)
-
-        for record in self.annotations_by_image.get(image_file, []):
-            self._draw_record_on_canvas(canvas, record)
-
-        self._draw_points(canvas, self.polygon_points, (0, 255, 255), closed=False)
-        if self.mode == "fit":
-            self._draw_points(canvas, self.fit_points, (255, 255, 0), closed=False)
-        if self.current_ellipse is not None:
-            self._draw_ellipse_result_on_canvas(canvas, self.current_ellipse)
-
-        status = f"{self.image_path.name} | mode={self.mode} | {self.message}"
-        cv2.rectangle(canvas, (0, 0), (self.display_width, 34), (0, 0, 0), -1)
-        cv2.putText(canvas, status[:180], (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-
-    def _draw_points(
-        self,
-        canvas: np.ndarray,
-        points: list[tuple[float, float]],
-        color: tuple[int, int, int],
-        closed: bool,
-    ) -> None:
-        if not points:
-            return
-        screen_pts = [self._image_to_screen(p) for p in points]
-        for p in screen_pts:
-            cv2.circle(canvas, p, 4, color, -1)
-        if len(screen_pts) >= 2:
-            cv2.polylines(canvas, [np.array(screen_pts, dtype=np.int32)], closed, color, 2)
-        if len(screen_pts) >= 1:
-            cv2.circle(canvas, screen_pts[0], 8, (0, 0, 255), 2)
-
-    def _draw_record_on_canvas(self, canvas: np.ndarray, record: AnnotationRecord) -> None:
-        points = [(float(x), float(y)) for x, y in record.polygon_points]
-        self._draw_points(canvas, points, (0, 0, 255), closed=True)
-        self._draw_ellipse_dict(canvas, record.ellipse, scale=self.zoom, offset=(self.view_x, self.view_y))
-
-    def _draw_ellipse_result_on_canvas(self, canvas: np.ndarray, ellipse: EllipseResult) -> None:
-        ellipse_dict = ellipse_to_dict(ellipse)
-        self._draw_ellipse_dict(canvas, ellipse_dict, scale=self.zoom, offset=(self.view_x, self.view_y))
-
-    def _draw_ellipse_dict(
-        self,
-        image: np.ndarray,
-        ellipse: dict[str, object],
-        *,
-        scale: float,
-        offset: tuple[float, float],
-    ) -> None:
-        center = ellipse["center"]
-        long_endpoints = ellipse["long_axis_endpoints"]
-        short_endpoints = ellipse["short_axis_endpoints"]
-        long_diam_px = float(ellipse["long_diam_px"])
-        short_diam_px = float(ellipse["short_diam_px"])
-        angle_deg = float(ellipse["angle_deg"])
-
-        def transform(p: list[float] | tuple[float, float]) -> tuple[int, int]:
-            return (
-                int(round((float(p[0]) - offset[0]) * scale)),
-                int(round((float(p[1]) - offset[1]) * scale)),
+            messagebox.showinfo(
+                "Saved",
+                f"Saved surface {surface_id}.\n"
+                f"Knots: {len(self.current_knot_rows)}",
             )
 
-        c = transform(center)  # type: ignore[arg-type]
-        axes = (max(1, int(round(long_diam_px * scale / 2))), max(1, int(round(short_diam_px * scale / 2))))
-        cv2.ellipse(image, c, axes, angle_deg, 0, 360, (0, 255, 0), 2)
-        cv2.circle(image, c, 4, (0, 255, 0), -1)
-        lp1 = transform(long_endpoints[0])  # type: ignore[index]
-        lp2 = transform(long_endpoints[1])  # type: ignore[index]
-        sp1 = transform(short_endpoints[0])  # type: ignore[index]
-        sp2 = transform(short_endpoints[1])  # type: ignore[index]
-        cv2.line(image, lp1, lp2, (255, 0, 255), 2)
-        cv2.line(image, sp1, sp2, (255, 255, 0), 2)
+            self._prepare_next_surface()
 
+        except Exception as error:
+            messagebox.showerror("Finish surface failed", str(error))
 
-def build_arg_parser() -> argparse.ArgumentParser:
-    default_root = project_root_from_this_file()
-    parser = argparse.ArgumentParser(description="Manual knot measurement tool.")
-    parser.add_argument(
-        "--image-dir",
-        type=Path,
-        default=default_root / "data" / "images" / "wood_joined_cropped",
-        help="Directory containing surface images.",
-    )
-    parser.add_argument(
-        "--annotation-dir",
-        type=Path,
-        default=default_root / "data" / "annotations" / "manual_measure",
-        help="Directory to save annotation outputs.",
-    )
-    parser.add_argument(
-        "--surface-info-path",
-        type=Path,
-        default=default_root / "data" / "input" / "surface_info.csv",
-        help="Path to surface_info.csv.",
-    )
-    parser.add_argument(
-        "--lumber-id",
-        type=str,
-        default=None,
-        help="Default lumber_id used when prompting is disabled or left blank.",
-    )
-    parser.add_argument(
-        "--no-prompt-surface-info",
-        action="store_true",
-        help="Do not prompt for surface metadata. Defaults are used instead.",
-    )
-    parser.add_argument("--display-width", type=int, default=1600)
-    parser.add_argument("--display-height", type=int, default=900)
-    return parser
+    def _prepare_next_surface(self) -> None:
+        self.image_path = None
+        self.image_bgr = None
+        self.image_rgb = None
+        self.image_width_px = 0
+        self.image_height_px = 0
+
+        self.current_polygon = []
+        self.current_fit_points = []
+        self.current_polygon_closed = False
+        self.current_knot_rows = []
+        self.current_detail_records = []
+
+        self.image_path_var.set("")
+        self.surface_id_var.set("")
+        self.status_var.set("Select next surface image.")
+
+        self._show_selection_frame()
+
+    def _back_without_saving(self) -> None:
+        proceed = messagebox.askyesno(
+            "Back without saving",
+            "Current surface annotations will be discarded. Continue?",
+        )
+
+        if proceed:
+            self._prepare_next_surface()
+
+    # -------------------------------------------------------------------------
+    # Common
+    # -------------------------------------------------------------------------
+
+    def _clear_root(self) -> None:
+        for child in self.root.winfo_children():
+            child.destroy()
 
 
 def main() -> None:
-    parser = build_arg_parser()
-    args = parser.parse_args()
-
-    project_root = project_root_from_this_file()
-    app = ManualMeasureApp(
-        project_root=project_root,
-        image_dir=args.image_dir,
-        annotation_dir=args.annotation_dir,
-        surface_info_path=args.surface_info_path,
-        default_lumber_id=args.lumber_id,
-        no_prompt_surface_info=args.no_prompt_surface_info,
-        display_width=args.display_width,
-        display_height=args.display_height,
-    )
-    app.run()
+    root = tk.Tk()
+    ManualMeasureApp(root)
+    root.mainloop()
 
 
 if __name__ == "__main__":
