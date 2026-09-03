@@ -628,6 +628,12 @@ class ManualMeasureApp:
             fill=tk.X, pady=2
         )
 
+        ttk.Button(
+            control,
+            text="Clear ellipse arc points",
+            command=self._clear_fit_points,
+        ).pack(fill=tk.X, pady=2)
+
         ttk.Label(
             control,
             textvariable=self.status_var,
@@ -912,6 +918,8 @@ class ManualMeasureApp:
     def _on_left_click(self, event: tk.Event) -> None:
         point = self._canvas_to_image(event)
 
+        # Polygon has already been closed.
+        # After closing, left clicks are used only for selected ellipse arc points.
         if self.current_polygon_closed:
             if self.selected_arc_mode_var.get():
                 self.current_fit_points.append(point)
@@ -920,8 +928,15 @@ class ManualMeasureApp:
                     "Click Save current knot when finished."
                 )
                 self._redraw_overlay()
+            else:
+                self.status_var.set(
+                    "Polygon is already closed. "
+                    "Turn on 'Use selected ellipse arc points' to select ellipse-only points, "
+                    "or click Save current knot."
+                )
             return
 
+        # Close polygon when clicking near the first point.
         if len(self.current_polygon) >= 3:
             first_point = self.current_polygon[0]
             threshold = CLOSE_POINT_RADIUS_SCREEN_PX / self.scale
@@ -934,10 +949,13 @@ class ManualMeasureApp:
                         "Polygon closed. Select at least 5 ellipse arc points, "
                         "then click Save current knot."
                     )
-                    self._redraw_overlay()
                 else:
-                    self._save_current_knot()
+                    self.status_var.set(
+                        "Polygon closed. Auto ellipse is previewed. "
+                        "Click Save current knot, or turn on selected arc mode and choose ellipse-only points."
+                    )
 
+                self._redraw_overlay()
                 return
 
         self.current_polygon.append(point)
@@ -957,14 +975,21 @@ class ManualMeasureApp:
             if len(self.current_polygon) < 3:
                 raise ValueError("At least 3 polygon points are required.")
 
-            if self.selected_arc_mode_var.get():
+            if self.current_fit_points:
                 if len(self.current_fit_points) < 5:
                     raise ValueError(
-                        "At least 5 ellipse arc points are required in selected-arc mode."
+                        "At least 5 ellipse arc points are required. "
+                        "Add more points or clear selected arc points."
                     )
-                fit_points = self.current_fit_points[:]
+
+                fit_points = densify_polyline(
+                    self.current_fit_points,
+                    closed=False,
+                    step=AUTO_DENSIFY_STEP_PX,
+                )
                 fit_method = "selected_arc_fit"
                 stored_fit_points = self.current_fit_points[:]
+
             else:
                 fit_points = densify_polyline(
                     self.current_polygon,
@@ -1053,6 +1078,7 @@ class ManualMeasureApp:
 
         if reset_truncated:
             self.is_truncated_var.set(False)
+            self.selected_arc_mode_var.set(False)
 
         self._redraw_overlay()
 
@@ -1067,6 +1093,12 @@ class ManualMeasureApp:
 
         self.status_var.set(f"Removed {removed.get('knot_id')}.")
         self._redraw_overlay()
+
+    def _clear_fit_points(self) -> None:
+            self.current_fit_points = []
+            self.status_var.set("Cleared ellipse arc points.")
+            self._redraw_overlay()
+
 
     def _draw_ellipse_on_canvas(
         self,
@@ -1138,13 +1170,18 @@ class ManualMeasureApp:
             return
 
         try:
-            if self.selected_arc_mode_var.get():
-                if len(self.current_fit_points) < 5:
-                    return
-
-                fit_points = self.current_fit_points[:]
+            # If enough selected arc points exist, preview selected-arc ellipse.
+            if len(self.current_fit_points) >= 5:
+                fit_points = densify_polyline(
+                    self.current_fit_points,
+                    closed=False,
+                    step=AUTO_DENSIFY_STEP_PX,
+                )
                 fit_method = "selected_arc_fit_preview"
+                color = "lime"
+                dash = (5, 3)
 
+            # Otherwise, preview auto-fit ellipse from polygon.
             else:
                 if len(self.current_polygon) < 3:
                     return
@@ -1155,19 +1192,22 @@ class ManualMeasureApp:
                     step=AUTO_DENSIFY_STEP_PX,
                 )
                 fit_method = "fit_ellipse_preview"
+                color = "gray"
+                dash = (3, 3)
 
             ellipse = fit_ellipse_from_points(fit_points, fit_method)
 
             self._draw_ellipse_on_canvas(
                 ellipse,
-                color="lime",
+                color=color,
                 width=2,
-                dash=(5, 3),
+                dash=dash,
             )
 
         except Exception:
             return
 
+        
     # -------------------------------------------------------------------------
     # Surface operations
     # -------------------------------------------------------------------------
