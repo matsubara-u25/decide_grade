@@ -74,11 +74,6 @@ CLOSE_POINT_RADIUS_SCREEN_PX = 12
 POLYGON_POINT_RADIUS = 4
 FIT_POINT_RADIUS = 4
 
-# VIEW_PADDING_BASE_PX = 300
-# VIEW_PADDING_MIN_PX = 150
-# VIEW_PADDING_MAX_PX = 2500
-
-
 MIN_ZOOM = 0.05
 MAX_ZOOM = 8.0
 ZOOM_IN_FACTOR = 1.15
@@ -87,6 +82,9 @@ ZOOM_OUT_FACTOR = 1 / ZOOM_IN_FACTOR
 VIEW_MARGIN_SCREEN_PX = 700
 
 AUTO_DENSIFY_STEP_PX = 2.0
+
+MEASUREMENT_AXIS_SCAN_STEPS = 250
+GEOMETRY_EPS = 1e-9
 
 
 # =============================================================================
@@ -362,6 +360,269 @@ def bbox_from_polygon(points: list[Point]) -> dict[str, float]:
         "width_max_pos": round_float(max(ys)),
     }
 
+def _dot(a: Point, b: Point) -> float:
+    return a[0] * b[0] + a[1] * b[1]
+
+
+def _cross(a: Point, b: Point) -> float:
+    return a[0] * b[1] - a[1] * b[0]
+
+
+def _sub(a: Point, b: Point) -> Point:
+    return a[0] - b[0], a[1] - b[1]
+
+
+def _add(a: Point, b: Point) -> Point:
+    return a[0] + b[0], a[1] + b[1]
+
+
+def _mul(a: Point, s: float) -> Point:
+    return a[0] * s, a[1] * s
+
+
+def _norm(a: Point) -> float:
+    return math.hypot(a[0], a[1])
+
+
+def _unit(a: Point) -> Point:
+    length = _norm(a)
+
+    if length <= GEOMETRY_EPS:
+        raise ValueError("Zero-length vector cannot be normalized.")
+
+    return a[0] / length, a[1] / length
+
+
+def _deduplicate_sorted_values(values: list[float], eps: float = 1e-6) -> list[float]:
+    if not values:
+        return []
+
+    values = sorted(values)
+    result = [values[0]]
+
+    for value in values[1:]:
+        if abs(value - result[-1]) > eps:
+            result.append(value)
+
+    return result
+
+
+def _point_in_polygon(point: Point, polygon: list[Point]) -> bool:
+    pts = np.array(polygon, dtype=np.float32)
+    result = cv2.pointPolygonTest(pts, point, False)
+    return result >= 0
+
+
+def _line_polygon_intersection_parameters(
+    *,
+    origin: Point,
+    direction: Point,
+    polygon: list[Point],
+) -> list[float]:
+    """Return line parameters where an infinite line intersects polygon edges.
+
+    A point on the line is represented as:
+        origin + s * direction
+    """
+    if len(polygon) < 3:
+        return []
+
+    direction = _unit(direction)
+
+    parameters: list[float] = []
+    n = len(polygon)
+
+    for i in range(n):
+        p1 = polygon[i]
+        p2 = polygon[(i + 1) % n]
+
+        edge = _sub(p2, p1)
+        denom = _cross(direction, edge)
+
+        # Non-parallel case.
+        if abs(denom) > GEOMETRY_EPS:
+            diff = _sub(p1, origin)
+            s = _cross(diff, edge) / denom
+            t = _cross(diff, direction) / denom
+
+            if -GEOMETRY_EPS <= t <= 1.0 + GEOMETRY_EPS:
+                parameters.append(s)
+
+        # Parallel or nearly parallel.
+        else:
+            # If the edge lies on the line, include both endpoints.
+            diff = _sub(p1, origin)
+
+            if abs(_cross(diff, direction)) <= 1e-6:
+                parameters.append(_dot(_sub(p1, origin), direction))
+                parameters.append(_dot(_sub(p2, origin), direction))
+
+    return _deduplicate_sorted_values(parameters)
+
+
+def _line_polygon_inside_segments(
+    *,
+    origin: Point,
+    direction: Point,
+    polygon: list[Point],
+) -> list[tuple[Point, Point, float]]:
+    """Return line segments inside a polygon.
+
+    Each returned item is:
+        (endpoint1, endpoint2, length)
+    """
+    direction = _unit(direction)
+
+    params = _line_polygon_intersection_parameters(
+        origin=origin,
+        direction=direction,
+        polygon=polygon,
+    )
+
+    if len(params) < 2:
+        return []
+
+    segments: list[tuple[Point, Point, float]] = []
+
+    for s1, s2 in zip(params[:-1], params[1:]):
+        if s2 - s1 <= GEOMETRY_EPS:
+            continue
+
+        smid = (s1 + s2) / 2.0
+        midpoint = _add(origin, _mul(direction, smid))
+
+        if not _point_in_polygon(midpoint, polygon):
+            continue
+
+        p1 = _add(origin, _mul(direction, s1))
+        p2 = _add(origin, _mul(direction, s2))
+        length = distance(p1, p2)
+
+        segments.append((p1, p2, length))
+
+    return segments
+
+
+def _long_axis_direction_from_ellipse(ellipse: dict[str, object]) -> Point:
+    long_axis_endpoints = ellipse["long_axis_endpoints"]
+
+    p1 = (
+        float(long_axis_endpoints[0][0]),
+        float(long_axis_endpoints[0][1]),
+    )
+    p2 = (
+        float(long_axis_endpoints[1][0]),
+        float(long_axis_endpoints[1][1]),
+    )
+
+    return _unit(_sub(p2, p1))
+
+
+def _longest_segment(segments: list[tuple[Point, Point, float]]) -> tuple[Point, Point, float]:
+    if not segments:
+        raise ValueError("No segment was found inside the polygon.")
+
+    return max(segments, key=lambda item: item[2])
+
+
+def calculate_visible_max_min1_axes(
+    polygon: list[Point],
+    ellipse: dict[str, object],
+) -> dict[str, object]:
+    """Calculate max and min1 for a truncated knot.
+
+    max:
+        Segment of the fitted ellipse major-axis line that lies inside
+        the visible knot polygon.
+
+    min1:
+        Longest segment inside the visible knot polygon in the direction
+        perpendicular to max.
+    """
+    if len(polygon) < 3:
+        raise ValueError("At least 3 polygon points are required.")
+
+    center = ellipse["center"]
+    origin = (float(center[0]), float(center[1]))
+
+    major_dir = _long_axis_direction_from_ellipse(ellipse)
+    minor_dir = (-major_dir[1], major_dir[0])
+
+    # max: visible part of the fitted ellipse major-axis line.
+    max_segments = _line_polygon_inside_segments(
+        origin=origin,
+        direction=major_dir,
+        polygon=polygon,
+    )
+
+    max_p1, max_p2, max_length = _longest_segment(max_segments)
+
+    # min1: longest polygon chord perpendicular to max.
+    projected_values = [
+        _dot(_sub(point, origin), major_dir)
+        for point in polygon
+    ]
+
+    t_min = min(projected_values)
+    t_max = max(projected_values)
+
+    candidate_t_values = list(projected_values)
+
+    if t_max - t_min > GEOMETRY_EPS:
+        for i in range(MEASUREMENT_AXIS_SCAN_STEPS + 1):
+            t = t_min + (t_max - t_min) * i / MEASUREMENT_AXIS_SCAN_STEPS
+            candidate_t_values.append(t)
+
+    candidate_t_values = _deduplicate_sorted_values(candidate_t_values)
+
+    best_min1: tuple[Point, Point, float] | None = None
+
+    for t in candidate_t_values:
+        line_origin = _add(origin, _mul(major_dir, t))
+
+        segments = _line_polygon_inside_segments(
+            origin=line_origin,
+            direction=minor_dir,
+            polygon=polygon,
+        )
+
+        if not segments:
+            continue
+
+        current = _longest_segment(segments)
+
+        if best_min1 is None or current[2] > best_min1[2]:
+            best_min1 = current
+
+    if best_min1 is None:
+        raise ValueError("No min1 segment was found inside the polygon.")
+
+    min1_p1, min1_p2, min1_length = best_min1
+
+    max_dx = max_p2[0] - max_p1[0]
+    max_dy = max_p2[1] - max_p1[1]
+
+    min1_dx = min1_p2[0] - min1_p1[0]
+    min1_dy = min1_p2[1] - min1_p1[1]
+
+    return {
+        "method": "visible_major_axis_max_and_perpendicular_min1",
+        "max_endpoints": [
+            [round_float(max_p1[0]), round_float(max_p1[1])],
+            [round_float(max_p2[0]), round_float(max_p2[1])],
+        ],
+        "min1_endpoints": [
+            [round_float(min1_p1[0]), round_float(min1_p1[1])],
+            [round_float(min1_p2[0]), round_float(min1_p2[1])],
+        ],
+        "max_length": round_float(max_length),
+        "min1_length": round_float(min1_length),
+        "long_diam_length": round_float(max_dx),
+        "long_diam_width": round_float(max_dy),
+        "short_diam_length": round_float(min1_dx),
+        "short_diam_width": round_float(min1_dy),
+    }
+
 
 # =============================================================================
 # Preview drawing
@@ -384,8 +645,15 @@ def draw_preview(
 
         try:
             center = ellipse["center"]
-            long_ep = ellipse["long_axis_endpoints"]
-            short_ep = ellipse["short_axis_endpoints"]
+
+            measurement_axes = detail.get("measurement_axes")
+
+            if measurement_axes is not None:
+                long_ep = measurement_axes["max_endpoints"]
+                short_ep = measurement_axes["min1_endpoints"]
+            else:
+                long_ep = ellipse["long_axis_endpoints"]
+                short_ep = ellipse["short_axis_endpoints"]
 
             center_pt = (int(round(center[0])), int(round(center[1])))
 
@@ -1037,8 +1305,15 @@ class ManualMeasureApp:
 
         try:
             center = ellipse["center"]
-            long_ep = ellipse["long_axis_endpoints"]
-            short_ep = ellipse["short_axis_endpoints"]
+
+            measurement_axes = detail.get("measurement_axes")
+
+            if measurement_axes is not None:
+                long_ep = measurement_axes["max_endpoints"]
+                short_ep = measurement_axes["min1_endpoints"]
+            else:
+                long_ep = ellipse["long_axis_endpoints"]
+                short_ep = ellipse["short_axis_endpoints"]
 
             cx, cy = self._image_to_canvas((float(center[0]), float(center[1])))
             long_p1 = self._image_to_canvas((float(long_ep[0][0]), float(long_ep[0][1])))
@@ -1048,11 +1323,13 @@ class ManualMeasureApp:
 
             self.canvas.create_line(*long_p1, *long_p2, fill="blue", width=2, tags=("overlay",))
             self.canvas.create_line(*short_p1, *short_p2, fill="yellow", width=2, tags=("overlay",))
+
             self._draw_ellipse_on_canvas(
                 ellipse,
                 color="lime",
                 width=2,
             )
+
             self.canvas.create_oval(cx - 3, cy - 3, cx + 3, cy + 3, fill="white", tags=("overlay",))
             self.canvas.create_text(
                 cx + 12,
@@ -1139,6 +1416,27 @@ class ManualMeasureApp:
             ellipse = fit_ellipse_from_points(fit_points, fit_method)
             bbox = bbox_from_polygon(self.current_polygon)
 
+            measurement_axes = None
+
+            if self.is_truncated_var.get():
+                measurement_axes = calculate_visible_max_min1_axes(
+                    polygon=self.current_polygon,
+                    ellipse=ellipse,
+                )
+
+            if measurement_axes is not None:
+                long_diam_length = measurement_axes["long_diam_length"]
+                long_diam_width = measurement_axes["long_diam_width"]
+                short_diam_length = measurement_axes["short_diam_length"]
+                short_diam_width = measurement_axes["short_diam_width"]
+                output_method = f"{ellipse['method']}_visible_max_min1"
+            else:
+                long_diam_length = ellipse["long_diam_length"]
+                long_diam_width = ellipse["long_diam_width"]
+                short_diam_length = ellipse["short_diam_length"]
+                short_diam_width = ellipse["short_diam_width"]
+                output_method = ellipse["method"]
+
             lumber_id = self.lumber_id_var.get().strip()
             surface_id = self.surface_id_var.get().strip()
             image_file = path_to_storable_string(Path(self.image_path_var.get()))
@@ -1159,11 +1457,11 @@ class ManualMeasureApp:
                 "width_max_pos": bbox["width_max_pos"],
                 "center_point_length": ellipse["center"][0],
                 "center_point_width": ellipse["center"][1],
-                "long_diam_length": ellipse["long_diam_length"],
-                "long_diam_width": ellipse["long_diam_width"],
-                "short_diam_length": ellipse["short_diam_length"],
-                "short_diam_width": ellipse["short_diam_width"],
-                "ellipse_method": ellipse["method"],
+                "long_diam_length": long_diam_length,
+                "long_diam_width": long_diam_width,
+                "short_diam_length": short_diam_length,
+                "short_diam_width": short_diam_width,
+                "ellipse_method": output_method,
                 "is_truncated": str(bool(self.is_truncated_var.get())),
                 "created_at": created_at,
             }
@@ -1182,9 +1480,11 @@ class ManualMeasureApp:
                     for x, y in stored_fit_points
                 ],
                 "selected_fit_segment_indices": self.current_fit_segment_indices[:],
+                "measurement_method": output_method,
                 "ellipse_method": ellipse["method"],
                 "bbox": bbox,
                 "ellipse": ellipse,
+                "measurement_axes": measurement_axes,
                 "is_truncated": bool(self.is_truncated_var.get()),
                 "created_at": created_at,
                 "comment": "",
@@ -1435,12 +1735,65 @@ class ManualMeasureApp:
 
             ellipse = fit_ellipse_from_points(fit_points, fit_method)
 
+            if self.is_truncated_var.get():
+                try:
+                    measurement_axes = calculate_visible_max_min1_axes(
+                        polygon=self.current_polygon,
+                        ellipse=ellipse,
+                    )
+
+                    self._draw_measurement_axes_on_canvas(
+                        measurement_axes,
+                        long_color="blue",
+                        short_color="yellow",
+                        width=2,
+                        dash=(4, 2),
+                    )
+                except Exception:
+                    pass
+
             self._draw_ellipse_on_canvas(
                 ellipse,
                 color=color,
                 width=2,
                 dash=dash,
             )
+
+        except Exception:
+            return
+
+    def _draw_measurement_axes_on_canvas(
+        self,
+        measurement_axes: dict[str, object],
+        *,
+        long_color: str = "blue",
+        short_color: str = "yellow",
+        width: int = 2,
+        dash: tuple[int, int] | None = None,
+    ) -> None:
+        if self.canvas is None:
+            return
+
+        try:
+            max_ep = measurement_axes["max_endpoints"]
+            min1_ep = measurement_axes["min1_endpoints"]
+
+            max_p1 = self._image_to_canvas((float(max_ep[0][0]), float(max_ep[0][1])))
+            max_p2 = self._image_to_canvas((float(max_ep[1][0]), float(max_ep[1][1])))
+
+            min1_p1 = self._image_to_canvas((float(min1_ep[0][0]), float(min1_ep[0][1])))
+            min1_p2 = self._image_to_canvas((float(min1_ep[1][0]), float(min1_ep[1][1])))
+
+            kwargs = {
+                "width": width,
+                "tags": ("overlay",),
+            }
+
+            if dash is not None:
+                kwargs["dash"] = dash
+
+            self.canvas.create_line(*max_p1, *max_p2, fill=long_color, **kwargs)
+            self.canvas.create_line(*min1_p1, *min1_p2, fill=short_color, **kwargs)
 
         except Exception:
             return
